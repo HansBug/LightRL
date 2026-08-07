@@ -74,6 +74,9 @@ if [[ -n "${EVAL_PROMPT_DATA:-}" ]]; then
   EVAL_DATASET_NAME="${EVAL_DATASET_NAME:-seta}"
   EVAL_ARGS+=(--eval-prompt-data "${EVAL_DATASET_NAME}" "${EVAL_PROMPT_DATA}")
 fi
+if [[ -n "${EVAL_INTERVAL:-}" ]]; then
+  EVAL_ARGS+=(--eval-interval "${EVAL_INTERVAL}")
+fi
 if [[ -n "${EVAL_FUNCTION_PATH:-}" ]]; then
   EVAL_ARGS+=(--eval-function-path "${EVAL_FUNCTION_PATH}")
 fi
