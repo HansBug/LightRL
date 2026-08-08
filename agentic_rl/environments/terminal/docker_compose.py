@@ -491,6 +491,12 @@ def build_docker_image(
                 )
             except Exception as exc:
                 message = _shorten_output(str(exc), max_chars=1200) or type(exc).__name__
+                if isinstance(exc, subprocess.CalledProcessError):
+                    # str(exc) only carries the exit status; surface the build's
+                    # stderr tail so the cached failure is self-diagnosing.
+                    detail = _shorten_output(exc.stderr or exc.stdout, max_chars=1200)
+                    if detail:
+                        message = f"{message} | output: {detail}"
                 _BUILD_FAILED[build_key] = (time.time(), message)
                 if _is_deterministic_build_failure(message):
                     _blacklist_task_image(build_key, message)
