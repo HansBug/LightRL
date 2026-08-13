@@ -6,7 +6,20 @@ CKPT_ARGS=(
 )
 # Only add --save / --load / --save-interval when checkpointing is enabled
 if [[ -n "${SAVE_CKPT}" ]]; then
-  CKPT_ARGS+=(--save "${SAVE_CKPT}" --save-interval "${SAVE_INTERVAL}")
+  CKPT_ARGS+=(
+    --save "${SAVE_CKPT}"
+    --save-interval "${SAVE_INTERVAL}"
+    --max-ckpt-keep "${MAX_CKPT_KEEP}"
+    --checkpoint-min-free-gb "${CHECKPOINT_MIN_FREE_GB:-128}"
+    --checkpoint-expected-gb "${CHECKPOINT_EXPECTED_GB:-0}"
+    --checkpoint-space-margin-ratio "${CHECKPOINT_SPACE_MARGIN_RATIO:-1.15}"
+  )
+  if [[ "${SAVE_FIRST_ROLLOUT}" == "1" ]]; then
+    CKPT_ARGS+=(--save-first-rollout)
+  fi
+  if [[ "${CHECKPOINT_SAVE_FATAL:-0}" == "1" ]]; then
+    CKPT_ARGS+=(--checkpoint-save-fatal)
+  fi
 fi
 if [[ -n "${RESUME_LOAD}" ]]; then
   CKPT_ARGS+=(--load "${RESUME_LOAD}")
@@ -70,7 +83,9 @@ EVAL_ARGS=(
   --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
   --eval-top-p "${EVAL_TOP_P}"
 )
-if [[ -n "${EVAL_PROMPT_DATA:-}" ]]; then
+if [[ -n "${EVAL_CONFIG:-}" ]]; then
+  EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
+elif [[ -n "${EVAL_PROMPT_DATA:-}" ]]; then
   EVAL_DATASET_NAME="${EVAL_DATASET_NAME:-seta}"
   EVAL_ARGS+=(--eval-prompt-data "${EVAL_DATASET_NAME}" "${EVAL_PROMPT_DATA}")
 fi
@@ -82,6 +97,13 @@ if [[ -n "${EVAL_FUNCTION_PATH:-}" ]]; then
 fi
 if [[ -n "${EVAL_TEMPERATURE:-}" ]]; then
   EVAL_ARGS+=(--eval-temperature "${EVAL_TEMPERATURE}")
+fi
+if [[ -n "${EVAL_SEED:-}" ]]; then
+  EVAL_ARGS+=(--eval-seed "${EVAL_SEED}")
+fi
+if [[ -n "${EVAL_STEPS:-}" ]]; then
+  read -r -a _EVAL_STEPS_ARRAY <<<"${EVAL_STEPS//,/ }"
+  EVAL_ARGS+=(--eval-steps "${_EVAL_STEPS_ARRAY[@]}")
 fi
 if [[ -n "${EVAL_TOP_K:-}" ]]; then
   EVAL_ARGS+=(--eval-top-k "${EVAL_TOP_K}")
@@ -198,8 +220,7 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_MODE="${WANDB_MODE:-offline}"
-WANDB_ENABLE="${WANDB_ENABLE:-0}"
-WANDB_KEY_VALUE="${WANDB_KEY:-${WANDB_API_KEY:-}}"
+WANDB_ENABLE="${WANDB_ENABLE:-1}"
 case "${WANDB_ENABLE,,}" in
   1|true|yes|on)
     WANDB_ENABLE_RESOLVED=1
@@ -209,7 +230,13 @@ case "${WANDB_ENABLE,,}" in
     ;;
 esac
 
-if [[ "${WANDB_MODE}" != "disabled" ]] && (( WANDB_ENABLE_RESOLVED || ${#WANDB_KEY_VALUE} > 0 )); then
+if [[ "${WANDB_MODE,,}" == "offline" ]]; then
+  # Offline logging neither needs nor should propagate credentials into Ray
+  # runtime metadata, process listings, or generated run configs.
+  unset WANDB_API_KEY WANDB_KEY
+fi
+
+if [[ "${WANDB_MODE,,}" != "disabled" ]] && (( WANDB_ENABLE_RESOLVED )); then
   WANDB_ARGS=(
     --use-wandb
     --wandb-mode    "${WANDB_MODE}"
@@ -217,9 +244,6 @@ if [[ "${WANDB_MODE}" != "disabled" ]] && (( WANDB_ENABLE_RESOLVED || ${#WANDB_K
     --wandb-group   "${WANDB_GROUP:-${MODEL_TAG}_4gpu}"
     --wandb-dir     "${WANDB_DIR}"
   )
-  if [[ -n "${WANDB_KEY_VALUE}" ]]; then
-    WANDB_ARGS+=(--wandb-key "${WANDB_KEY_VALUE}")
-  fi
 else
   WANDB_ARGS=()
 fi
@@ -228,6 +252,15 @@ SGLANG_ARGS=(
   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
   --sglang-mem-fraction-static 0.6
 )
+if [[ -n "${SGLANG_SERVER_CONCURRENCY:-}" ]]; then
+  SGLANG_ARGS+=(--sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}")
+fi
+if [[ "${SLIME_USE_FAULT_TOLERANCE:-0}" == "1" ]]; then
+  SGLANG_ARGS+=(--use-fault-tolerance)
+fi
+if [[ -n "${SLIME_SAVE_DEBUG_ROLLOUT_DATA:-}" ]]; then
+  SGLANG_ARGS+=(--save-debug-rollout-data "${SLIME_SAVE_DEBUG_ROLLOUT_DATA}")
+fi
 
 MISC_ARGS=(
   --attention-dropout 0.0
@@ -286,4 +319,3 @@ fi
 
 # NOTE: safety reward params are passed via env vars (RUNTIME_ENV_JSON below),
 # not CLI flags, because slime's argparse rejects unknown flags.
-

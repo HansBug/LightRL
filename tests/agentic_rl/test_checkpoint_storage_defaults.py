@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+PERSIST_ROOT = "/mnt/shared-storage-gpfs2/trustcyberdata/private/docker-infra/tmp/puyuan/lightrl"
+
+
+def test_persistent_checkpoint_and_wandb_defaults_are_shared():
+    paths = (ROOT / "agentic_rl/platform/paths.py").read_text(encoding="utf-8")
+    run_dir = (ROOT / "agentic_rl/platform/slime_train/lib_run_dir.sh").read_text(encoding="utf-8")
+
+    assert PERSIST_ROOT in paths
+    assert PERSIST_ROOT in run_dir
+    assert '${LIGHTRL_PERSIST_ROOT}/checkpoints' in run_dir
+    assert '${LIGHTRL_PERSIST_ROOT}/wandb/${RUN_ID}' in run_dir
+
+
+def test_wandb_is_offline_enabled_and_does_not_put_key_on_cli():
+    args = (ROOT / "agentic_rl/platform/slime_train/lib_args.sh").read_text(encoding="utf-8")
+
+    assert 'WANDB_MODE="${WANDB_MODE:-offline}"' in args
+    assert 'WANDB_ENABLE="${WANDB_ENABLE:-1}"' in args
+    assert "unset WANDB_API_KEY WANDB_KEY" in args
+    assert "--wandb-key" not in args
+
+
+def test_shell_cleanup_cannot_blindly_remove_checkpoint_directories():
+    launcher = (ROOT / "agentic_rl/platform/slime_train/lib_launch.sh").read_text(encoding="utf-8")
+
+    assert 'rm -rf "${CKPT_DIRS[$i]}"' not in launcher
+    assert "checkpoint_utils.py" in launcher
