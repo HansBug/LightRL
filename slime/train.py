@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 import ray
@@ -128,12 +129,27 @@ def train(args):
     pgs = create_placement_groups(args)
     init_tracking(args)
 
-    # create the rollout manager, with sglang engines inside.
-    # need to initialize rollout manager first to calculate num_rollout
-    rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    # Normally the rollout manager (and its SGLang engines) is initialized
+    # before the training actors.  On a tightly colocated large model this can
+    # leave a few GiB of CUDA context behind while Megatron constructs its
+    # first shard, causing an otherwise-fitting model to fail at init.  The
+    # opt-in ordering initializes Megatron first; colocate actors sleep at the
+    # end of init, releasing their device memory before SGLang starts.
+    delay_rollout_init = (
+        args.colocate and os.environ.get("SLIME_INIT_ACTOR_BEFORE_ROLLOUT", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if delay_rollout_init:
+        actor_model, critic_model = create_training_models(args, pgs, None)
+        rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+        actor_model.set_rollout_manager(rollout_manager)
+    else:
+        # create the rollout manager, with sglang engines inside.
+        # need to initialize rollout manager first to calculate num_rollout
+        rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
-    # create the actor and critic models
-    actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+        # create the actor and critic models
+        actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     if args.offload_rollout:
         ray.get(rollout_manager.onload_weights.remote())

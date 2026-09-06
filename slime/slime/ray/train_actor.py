@@ -56,6 +56,22 @@ class TrainRayActor(RayActor):
 
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         torch.cuda.set_device(f"cuda:{local_rank}")
+        if os.environ.get("LIGHTRL_DEBUG_GLM_BRIDGE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            logger.info(
+                "[GLM actor debug] rank=%s ray_gpu_ids=%s CVD=%s LOCAL_RANK=%s "
+                "device=%s device_count=%s",
+                self._rank,
+                ray.get_gpu_ids(),
+                os.environ.get("CUDA_VISIBLE_DEVICES"),
+                os.environ.get("LOCAL_RANK"),
+                torch.cuda.current_device(),
+                torch.cuda.device_count(),
+            )
 
         # Use hybrid backend when FSDP CPU offload is enabled with a CPU backend
         backend = args.distributed_backend

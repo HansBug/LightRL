@@ -918,7 +918,15 @@ def init_rollout_engines(args, pg, all_rollout_engines):
         if all_rollout_engines[i] is not None:
             continue
 
-        num_gpus = 0.2
+        # In colocate mode the rollout engine is explicitly offloaded while
+        # Megatron actors are initialized/trained.  Keeping the historical
+        # 0.2-GPU Ray reservation here would leave only 0.8 GPU in the
+        # placement-group bundle, so an exclusive 1-GPU Megatron actor can
+        # never be scheduled (it remains pending indefinitely).  The engine
+        # still keeps placement-group affinity, but its actual GPU ownership
+        # is managed by the offload/onload lifecycle.  Preserve the fractional
+        # reservation for non-colocated rollouts.
+        num_gpus = 0.0 if args.colocate else 0.2
         num_cpus = num_gpus
 
         # Get the base GPU ID from placement group
@@ -940,6 +948,21 @@ def init_rollout_engines(args, pg, all_rollout_engines):
                 "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                 "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                 "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                # Multi-pod RJobs cannot reliably complete SGLang's
+                # shared-memory/ZMQ broadcaster readiness handshake.  Keep
+                # this configurable and propagate it into the actor runtime.
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "true",
+                # GLM-5.1's 192-wide MLA head is not accepted by the
+                # installed Triton concat kernel.  The repository-level
+                # sitecustomize hook provides an equivalent torch fallback;
+                # propagate its opt-in switch into the Ray actor and the
+                # spawned SGLang server process.
+                "SGLANG_GLM51_SAFE_MLA_CONCAT": os.environ.get("SGLANG_GLM51_SAFE_MLA_CONCAT", "0"),
+                "SGLANG_RMSNORM_CPU_FALLBACK": os.environ.get("SGLANG_RMSNORM_CPU_FALLBACK", "0"),
+                "SGLANG_RMSNORM_BYPASS": os.environ.get("SGLANG_RMSNORM_BYPASS", "0"),
+                "SGLANG_DISABLE_PYNCCL": os.environ.get("SGLANG_DISABLE_PYNCCL", "0"),
+                "SGLANG_WEIGHT_LOADER_DISABLE_MMAP": os.environ.get("SGLANG_WEIGHT_LOADER_DISABLE_MMAP", "0"),
+                "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS": "false",
             }.items()
         }
 
@@ -1018,6 +1041,11 @@ def init_prm_engines(args, pg, all_prm_engines):
                 "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
                 "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
                 "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER": "true",
+                "SGLANG_GLM51_SAFE_MLA_CONCAT": os.environ.get("SGLANG_GLM51_SAFE_MLA_CONCAT", "0"),
+                "SGLANG_RMSNORM_CPU_FALLBACK": os.environ.get("SGLANG_RMSNORM_CPU_FALLBACK", "0"),
+                "SGLANG_RMSNORM_BYPASS": os.environ.get("SGLANG_RMSNORM_BYPASS", "0"),
+                "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS": "false",
             }.items()
         }
 

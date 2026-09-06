@@ -11,7 +11,7 @@ import torch.distributed as dist
 from megatron.core import mpu
 from ray.actor import ActorHandle
 from torch_memory_saver import torch_memory_saver
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
@@ -24,6 +24,7 @@ from slime.utils.reloadable_process_group import destroy_process_groups, monkey_
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
+from slime.utils.processing_utils import load_tokenizer
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
@@ -41,6 +42,35 @@ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _load_hf_config_compat(path: str):
+    """Load a HF config even when the image predates a model registration.
+
+    GLM-5.1 publishes ``model_type=glm_moe_dsa`` before the Transformers
+    version in the training image knows that architecture.  Megatron uses
+    this config only for metadata (quantization settings and model naming),
+    while its actual model shape comes from the explicit Megatron arguments.
+    Preserve the normal AutoConfig path and fall back to the generic
+    PretrainedConfig parser for this metadata-only use case.
+    """
+    try:
+        return AutoConfig.from_pretrained(path, trust_remote_code=True)
+    except ValueError as exc:
+        if "does not recognize this architecture" not in str(exc):
+            raise
+        logger.warning(
+            "Falling back to generic PretrainedConfig for %s because this "
+            "Transformers image does not register the checkpoint model type: %s",
+            path,
+            exc,
+        )
+        config = PretrainedConfig.from_pretrained(path)
+        config.model_type = "glm_moe_dsa"
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+            config.rope_theta = rope_parameters["rope_theta"]
+        return config
 
 
 def _offload_rollout_data_to_cpu(rollout_data: RolloutBatch) -> None:
@@ -108,8 +138,8 @@ class MegatronTrainRayActor(TrainRayActor):
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
             if i == dist.get_rank() % args.num_gpus_per_node:
-                self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-                self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+                self.hf_config = _load_hf_config_compat(args.hf_checkpoint)
+                self.tokenizer = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
         self.train_parallel_config = {

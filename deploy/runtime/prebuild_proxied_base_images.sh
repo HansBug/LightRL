@@ -132,12 +132,35 @@ EOF
        2>&1 | tail -3 | sed 's/^/    /'; then
     log "  [OK] ${BASE} now has apt proxy injected"
 
-    # 4. Quick smoke test: apt-get update inside this image should succeed.
-    if docker run --rm "${BASE}" sh -c 'apt-get update >/dev/null 2>&1' 2>/dev/null; then
+    # 4. Quick smoke test: apt-get update inside the *default Docker bridge*
+    #    must succeed.  Do not rely only on ENV inherited from the shadow
+    #    image: an existing local tag can retain stale metadata, and the old
+    #    check hid the actual apt error behind /dev/null.  Passing the
+    #    validated proxy explicitly makes this probe test the same task
+    #    network path used by SETA while the apt.conf file check below proves
+    #    that Dockerfiles inheriting this image will also work.
+    smoke_log="${WORK}/apt-smoke.log"
+    if timeout 180 docker run --rm --network bridge \
+         -e "HTTP_PROXY=${PROXY_URL}" \
+         -e "HTTPS_PROXY=${PROXY_URL}" \
+         -e "http_proxy=${PROXY_URL}" \
+         -e "https_proxy=${PROXY_URL}" \
+         -e "NO_PROXY=${NO_PROXY_LIST}" \
+         -e "no_proxy=${NO_PROXY_LIST}" \
+         "${BASE}" sh -c \
+           'set -eu; test -s /etc/apt/apt.conf.d/95proxies; \
+            apt-get -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update' \
+         >"${smoke_log}" 2>&1; then
       log "  [OK] apt-get update verified inside ${BASE}"
       OK=$((OK+1))
     else
-      log "  [WARN] apt-get update still failing in shadow image; proxy may still be wrong"
+      # Keep credentials out of the run log even if an operator supplied an
+      # authenticated proxy URL.  The final lines are enough to identify DNS,
+      # route, apt or certificate failures without dumping the whole output.
+      sed -E 's#https?://[^/@[:space:]]+@#http://***@#g' "${smoke_log}" \
+        | tail -20 | sed 's/^/    /' || true
+      log "  [WARN] apt-get update failed in shadow image; task builds using this base are not validated"
       FAIL=$((FAIL+1))
     fi
   else

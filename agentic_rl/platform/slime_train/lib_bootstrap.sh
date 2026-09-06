@@ -12,8 +12,14 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 else
   pkill -9 sglang || true
   sleep 2
-  ray stop --force || true
-  pkill -9 ray || true
+  # In direct mode the caller owns an already-running Ray cluster.  Stopping
+  # Ray here would tear down that head before slime/train.py can connect.
+  if [[ "${SLIME_SKIP_RAY_START:-0}" != "1" ]]; then
+    ray stop --force || true
+    pkill -9 ray || true
+  else
+    log "SLIME_SKIP_RAY_START=1; preserving caller-owned Ray cluster"
+  fi
   pkill -9 -f "agentic_rl.platform.router_cli" || true
   sleep 2
 fi

@@ -34,7 +34,10 @@ if [[ "${DEBUG_MODE}" == "1" ]]; then
   NUM_ROLLOUT="${NUM_ROLLOUT:-4}"
   ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4}"
   N_SAMPLES="${N_SAMPLES:-2}"
-  MAX_TOKENS_PER_GPU=8192
+  # Keep the debug default, but honor an explicit smoke override.  Large
+  # colocated models (for example GLM-5.1) need a small token budget to leave
+  # headroom for the training process beside SGLang's weights.
+  MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-8192}"
 else
   NUM_ROLLOUT="${NUM_ROLLOUT:-2000}"
   # each rollout = ROLLOUT_BATCH_SIZE * N_SAMPLES concurrent lease requests.
@@ -223,6 +226,15 @@ OPTIMIZER_ARGS=(
   --use-precision-aware-optimizer
 )
 
+# Large MoE smoke jobs can exhaust a 140-GiB device while importing the
+# checkpoint even when only LoRA parameters are trainable: the precision-aware
+# optimizer's main-parameter mirror defaults to fp32.  Keep production runs at
+# the historical default, but let a constrained launcher request the fp16
+# mirror explicitly (the option is validated by Megatron when enabled).
+if [[ -n "${MAIN_PARAMS_DTYPE:-}" ]]; then
+  OPTIMIZER_ARGS+=(--main-params-dtype "${MAIN_PARAMS_DTYPE}")
+fi
+
 WANDB_MODE="${WANDB_MODE:-offline}"
 WANDB_ENABLE="${WANDB_ENABLE:-1}"
 case "${WANDB_ENABLE,,}" in
@@ -254,8 +266,66 @@ fi
 
 SGLANG_ARGS=(
   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
-  --sglang-mem-fraction-static 0.6
+  # Keep the default used by existing jobs, while allowing very large
+  # checkpoints (whose weights can exceed 60% of a GPU) to opt into a larger
+  # static pool.  GLM-5.1 TP16 needs this to be above its ~114.7 GB weight
+  # footprint on a 140 GiB H200.
+  --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.6}"
 )
+# SGLang's pipeline-parallel size is intentionally opt-in.  A colocated
+# GLM-5.1 smoke can use one 4-node TP16/PP2 engine instead of two TP16
+# engines; this halves the CPU-side model copy held by each scheduler while
+# preserving the effective tensor-parallel width.  Keep existing launches at
+# the historical PP1 default unless the caller explicitly requests PP.
+if [[ -n "${SGLANG_PP_SIZE:-}" ]]; then
+  SGLANG_ARGS+=(--sglang-pipeline-parallel-size "${SGLANG_PP_SIZE}")
+fi
+if [[ -n "${SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT:-}" ]]; then
+  # This is consumed by the slime SGLang child wrapper; the upstream image
+  # keeps the corresponding barrier timeout as a module-level constant.
+  export SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT
+fi
+if [[ "${SGLANG_DISABLE_CUDA_GRAPH:-0}" == "1" ]]; then
+  # Large co-located checkpoints can fit their weights and KV pool but still
+  # OOM during CUDA-graph capture.  Keep this opt-in so normal jobs retain
+  # graph performance while constrained smoke tests can disable capture.
+  SGLANG_ARGS+=(--sglang-disable-cuda-graph)
+fi
+if [[ -n "${SGLANG_CPU_OFFLOAD_GB:-}" ]]; then
+  # A TP8 GLM-5.1 shard is close to the full 140-GiB H200 capacity even after
+  # Megatron offload.  Keep a caller-controlled CPU weight spill available for
+  # constrained smoke jobs; normal recipes leave it unset.
+  SGLANG_ARGS+=(--sglang-cpu-offload-gb "${SGLANG_CPU_OFFLOAD_GB}")
+fi
+if [[ -n "${SGLANG_QUANTIZATION:-}" ]]; then
+  # The published GLM-5.1 snapshot is BF16 and an unquantized TP8 engine is
+  # just over the H200 limit.  SGLang can instantiate its FP8 quantized MoE
+  # path directly from the same snapshot; keep this opt-in for smoke jobs.
+  SGLANG_ARGS+=(--sglang-quantization "${SGLANG_QUANTIZATION}")
+fi
+if [[ -n "${SGLANG_EXPERT_PARALLEL_SIZE:-}" ]]; then
+  # GLM-5.1 is an MoE checkpoint.  When the rollout TP group is colocated
+  # with Megatron's EP group, mirror that sharding in SGLang; otherwise its
+  # default EP=1 keeps all experts on every TP rank and can OOM during model
+  # construction even when the actor is fully offloaded.
+  SGLANG_ARGS+=(--sglang-expert-parallel-size "${SGLANG_EXPERT_PARALLEL_SIZE}")
+fi
+if [[ -n "${SGLANG_MOE_A2A_BACKEND:-}" ]]; then
+  # SGLang only activates expert-parallel dispatch for the DeepEP/Mooncake
+  # A2A backends.  Passing EP alone leaves DeepSeek/GLM experts replicated
+  # under the default ``none`` backend, so expose the backend explicitly for
+  # colocated MoE smoke jobs.
+  SGLANG_ARGS+=(--sglang-moe-a2a-backend "${SGLANG_MOE_A2A_BACKEND}")
+fi
+# NSA kernels are model/image dependent.  Keep the image defaults for normal
+# jobs, but allow constrained GLM smoke runs to select the Hopper-safe FA3
+# implementation when the FlashMLA sparse kernel does not return a token.
+if [[ -n "${SGLANG_NSA_PREFILL_BACKEND:-}" ]]; then
+  SGLANG_ARGS+=(--sglang-nsa-prefill-backend "${SGLANG_NSA_PREFILL_BACKEND}")
+fi
+if [[ -n "${SGLANG_NSA_DECODE_BACKEND:-}" ]]; then
+  SGLANG_ARGS+=(--sglang-nsa-decode-backend "${SGLANG_NSA_DECODE_BACKEND}")
+fi
 if [[ -n "${SGLANG_SERVER_CONCURRENCY:-}" ]]; then
   SGLANG_ARGS+=(--sglang-server-concurrency "${SGLANG_SERVER_CONCURRENCY}")
 fi

@@ -1,6 +1,7 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
+import os
 import re
 from contextlib import nullcontext
 from typing import Literal
@@ -19,6 +20,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.backends.megatron_utils.lora import apply_megatron_lora
 from slime.utils.misc import load_function
+
+from .bridge_compat import bridge_from_pretrained
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -82,9 +85,95 @@ def get_model_provider_func(
         return wrapped_model_provider
 
     if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
+        bridge = bridge_from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        # GLM-5.1's checkpoint intentionally keeps a separate lm_head.  On a
+        # 140-GiB H200 at TP16 the duplicated vocab projection leaves only a
+        # few MiB of headroom, so constrained smoke runs may opt into tied
+        # embeddings to reduce the model footprint.  The production default
+        # remains the checkpoint's native setting.
+        tie_word_embeddings = os.environ.get("GLM_TIE_WORD_EMBEDDINGS", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if tie_word_embeddings:
+            bridge.hf_config.tie_word_embeddings = True
+            # The command line is assembled from the checkpoint config before
+            # this provider is called, so it still contains
+            # ``--untie-embeddings-and-output-weights``.  Keep the opt-in
+            # smoke switch consistent with the model object as well; otherwise
+            # Megatron allocates a second vocabulary projection despite the
+            # bridge's HF config being tied.
+            args.untie_embeddings_and_output_weights = False
 
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        # Older mbridge releases do not expose ``to_megatron_provider`` and
+        # therefore return their provider directly from ``_model_provider``.
+        # Those providers build from ``bridge.config`` rather than slime's
+        # argparse namespace.  Synchronize the parallel dimensions here so a
+        # TP8×PP2 smoke actually constructs one pipeline half per rank (and
+        # not a full 78-layer model on every GPU).
+        bridge_config = getattr(bridge, "config", None)
+        if bridge_config is not None:
+            for config_name, arg_name in (
+                ("tensor_model_parallel_size", "tensor_model_parallel_size"),
+                ("pipeline_model_parallel_size", "pipeline_model_parallel_size"),
+                ("context_parallel_size", "context_parallel_size"),
+                ("expert_model_parallel_size", "expert_model_parallel_size"),
+                ("expert_tensor_parallel_size", "expert_tensor_parallel_size"),
+                ("sequence_parallel", "sequence_parallel"),
+            ):
+                if hasattr(args, arg_name):
+                    setattr(bridge_config, config_name, getattr(args, arg_name))
+        if os.environ.get("LIGHTRL_DEBUG_GLM_BRIDGE", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            # This is intentionally opt-in: it records the values that decide
+            # Megatron's per-pipeline-stage layer count without changing the
+            # normal provider behavior.
+            mpu_state = getattr(bridge, "mpu", None)
+            print(
+                "[GLM bridge debug] "
+                f"rank={os.environ.get('RANK', '?')} "
+                f"args_tp={getattr(args, 'tensor_model_parallel_size', None)} "
+                f"args_pp={getattr(args, 'pipeline_model_parallel_size', None)} "
+                f"mpu_tp={getattr(mpu_state, 'tp_size', None)} "
+                f"mpu_pp={getattr(mpu_state, 'pp_size', None)} "
+                f"config_tp={getattr(bridge_config, 'tensor_model_parallel_size', None)} "
+                f"config_pp={getattr(bridge_config, 'pipeline_model_parallel_size', None)} "
+                f"config_layers={getattr(bridge_config, 'num_layers', None)}",
+                flush=True,
+            )
+            # Wrap the mbridge spec factory so the actual number of local
+            # transformer layers is visible before CUDA allocation.  This
+            # distinguishes a PP partitioning bug from a genuinely oversized
+            # single-stage GLM MoE shard.
+            try:
+                from megatron.core import mpu
+
+                original_spec_factory = bridge._get_transformer_layer_spec
+
+                def _debug_spec_factory(vp_stage=None):
+                    spec = original_spec_factory(vp_stage)
+                    print(
+                        "[GLM bridge debug] "
+                        f"tp_rank={mpu.get_tensor_model_parallel_rank()} "
+                        f"pp_rank={mpu.get_pipeline_model_parallel_rank()} "
+                        f"spec_layers={len(getattr(spec, 'layer_specs', ()) or ())}",
+                        flush=True,
+                    )
+                    return spec
+
+                bridge._get_transformer_layer_spec = _debug_spec_factory
+            except Exception as exc:
+                print(f"[GLM bridge debug] spec wrapper unavailable: {exc}", flush=True)
+        if not hasattr(bridge, "to_megatron_provider"):
+            # mbridge stores the parallel-aware TransformerConfig in the
+            # bridge and exposes a provider through this factory.
+            return bridge._model_provider([])
         provider = bridge.to_megatron_provider(load_weights=False)
         # TODO: we should not manually set this...
         provider.tensor_model_parallel_size = args.tensor_model_parallel_size

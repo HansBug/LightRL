@@ -17,6 +17,16 @@ from .gpt2_tokenization import GPT2Tokenizer
 from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
 from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
 
+# Keep the legacy Megatron tokenizer path in sync with slime's tokenizer
+# compatibility helper.  GLM-5.1's tokenizer metadata names the
+# Transformers-5-only TokenizersBackend class, while the training image may
+# still run Transformers 4.x; ``load_tokenizer`` falls back to the valid
+# tokenizer.json in that case.
+try:
+    from slime.utils.processing_utils import load_tokenizer as _load_tokenizer
+except ImportError:
+    _load_tokenizer = None
+
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
@@ -134,11 +144,20 @@ class _HuggingFaceTokenizer(MegatronLegacyTokenizer):
             )
 
         # TODO(bnorick): download tokenizer once to lustre and use force offline to make sure all tasks read it from there
-        self._tokenizer = transformers.AutoTokenizer.from_pretrained(
+        tokenizer_kwargs = dict(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             trust_remote_code=True,
             **kwargs,
         )
+        if _load_tokenizer is not None:
+            # ``load_tokenizer`` names its positional model argument
+            # ``name_or_path`` (rather than the Transformers keyword), so
+            # pass the path positionally here.
+            self._tokenizer = _load_tokenizer(
+                pretrained_model_name_or_path, trust_remote_code=True, **kwargs
+            )
+        else:
+            self._tokenizer = transformers.AutoTokenizer.from_pretrained(**tokenizer_kwargs)
         self._vocab = self._tokenizer.get_vocab()
         self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
 

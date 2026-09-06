@@ -175,6 +175,33 @@ def iter_lora_modules(model: torch.nn.Module | list[torch.nn.Module]):
                 yield name, module
 
 
+@contextmanager
+def without_megatron_lora_parameters(model: torch.nn.Module | list[torch.nn.Module]):
+    """Temporarily hide adapter parameters from a base-checkpoint loader.
+
+    Megatron-Bridge walks ``state_dict()`` and maps every parameter to an HF
+    tensor.  Slime's adapters are deliberately local-only parameters, so they
+    have no HF counterpart and make the bridge raise on names such as
+    ``slime_lora_A``.  Removing them from the module parameter registries only
+    for the duration of the bridge load keeps the optimizer references intact
+    while allowing the native checkpoint weights to load normally.
+    """
+
+    modules = model if isinstance(model, list) else [model]
+    removed: list[tuple[torch.nn.Module, str, torch.nn.Parameter]] = []
+    for model_chunk in modules:
+        for module in model_chunk.modules():
+            for name in ("slime_lora_A", "slime_lora_B"):
+                param = module._parameters.pop(name, None)
+                if param is not None:
+                    removed.append((module, name, param))
+    try:
+        yield
+    finally:
+        for module, name, param in removed:
+            module._parameters[name] = param
+
+
 def _local_delta_weight(module: torch.nn.Module) -> torch.Tensor:
     return (module.slime_lora_B @ module.slime_lora_A) * module.slime_lora_scaling
 

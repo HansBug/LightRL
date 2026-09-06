@@ -59,6 +59,36 @@ class RayTrainGroup:
             **self.args.train_env_vars,
         }
 
+        # Rollout SGLang actors need to keep the pod-level UUID mask so that
+        # their child TP ranks can see all local devices.  Training actors are
+        # ordinary one-GPU Ray actors, however, and must receive Ray's
+        # per-actor CUDA_VISIBLE_DEVICES assignment.  Do not set the Ray
+        # NOSET switch to the string ``"0"`` here: Ray treats any non-empty
+        # value (including ``"0"``) as enabled and consequently leaves CVD
+        # unset, putting every colocated rank on physical GPU 0.  Removing the
+        # key lets Ray inject the one-device mask for each Megatron actor while
+        # leaving the rollout actor's explicit mask unchanged.
+        if self.args.train_backend == "megatron":
+            for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST:
+                env_vars.pop(name, None)
+            # The synchronous/direct launcher does not go through Ray Jobs'
+            # runtime_env, so pod-level NCCL/Gloo settings would otherwise be
+            # lost here.  In RJob pods the default interface is often an
+            # invalid eth0 and NCCL can spend many minutes retrying the first
+            # TP-group communicator (mbridge's initial scatter).  Forward the
+            # explicitly selected transport settings to every Megatron rank.
+            for name in (
+                "NCCL_IB_DISABLE",
+                "NCCL_SOCKET_IFNAME",
+                "GLOO_SOCKET_IFNAME",
+                "NCCL_P2P_DISABLE",
+                "NCCL_NVLS_ENABLE",
+                "CUDA_DEVICE_MAX_CONNECTIONS",
+            ):
+                value = os.environ.get(name)
+                if value:
+                    env_vars[name] = value
+
         if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver
 

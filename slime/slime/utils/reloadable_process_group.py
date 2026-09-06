@@ -12,6 +12,22 @@ logger = logging.getLogger(__name__)
 old_new_group_dict = {}
 
 
+def _get_gloo_group_or_none():
+    """Return the pre-initialized metadata group when available.
+
+    The monkey patch is installed before ``TrainRayActor.init`` creates the
+    process groups, so keep this lookup lazy.  Calls made before Gloo is
+    initialized retain the original collective behavior.
+    """
+
+    try:
+        from slime.utils.distributed_utils import get_gloo_group
+
+        return get_gloo_group()
+    except RuntimeError:
+        return None
+
+
 def monkey_patch_torch_dist():
     pid = os.getpid()
     if pid in old_new_group_dict:
@@ -47,10 +63,32 @@ def monkey_patch_torch_dist():
 
     dist.new_group = new_group
 
-    def get_new_function(func):
+    def get_new_function(func, use_gloo_for_object_collective=False):
         def new_function(*args, **kwargs):
             args = tuple([arg.group if isinstance(arg, ReloadableProcessGroup) else arg for arg in args])
             kwargs = {k: (v.group if isinstance(v, ReloadableProcessGroup) else v) for k, v in kwargs.items()}
+
+            # ``all_gather_object`` is used for tiny Python metadata (for
+            # example, optimizer parameter-group names).  PyTorch implements
+            # the operation by serializing the object into CPU tensors, so
+            # routing it through the default NCCL group can launch an
+            # unnecessary CUDA kernel and, on some multi-node setups, stall
+            # during optimizer construction.  TrainRayActor initializes the
+            # full-rank Gloo group before any model/optimizer setup; use that
+            # group whenever the caller did not explicitly choose one.
+            if use_gloo_for_object_collective:
+                group = kwargs.get("group")
+                if len(args) >= 3:
+                    group = args[2]
+                    if group is None:
+                        args = list(args)
+                        args[2] = _get_gloo_group_or_none()
+                        args = tuple(args)
+                elif group is None:
+                    gloo_group = _get_gloo_group_or_none()
+                    if gloo_group is not None:
+                        kwargs["group"] = gloo_group
+
             with _wrap_low_level_call():
                 return func(*args, **kwargs)
 
@@ -66,7 +104,7 @@ def monkey_patch_torch_dist():
     dist.all_reduce = get_new_function(dist.all_reduce)
     dist.all_gather = get_new_function(dist.all_gather)
     dist.all_gather_into_tensor = get_new_function(dist.all_gather_into_tensor)
-    dist.all_gather_object = get_new_function(dist.all_gather_object)
+    dist.all_gather_object = get_new_function(dist.all_gather_object, use_gloo_for_object_collective=True)
     dist.all_to_all = get_new_function(dist.all_to_all)
     dist.all_to_all_single = get_new_function(dist.all_to_all_single)
     dist.broadcast = get_new_function(dist.broadcast)

@@ -1,8 +1,10 @@
 import dataclasses
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
+from pathlib import Path
 import time
 from urllib.parse import quote
 
@@ -17,6 +19,74 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_glm51_sglang_model_path(model_path: str, model_name: str | None) -> str:
+    """Return a SGLang-compatible view of the GLM-5.1 checkpoint.
+
+    GLM-5.1 uses the DeepSeek-V3/NSA tensor layout, but its published config
+    advertises the new ``glm_moe_dsa`` Transformers model type.  The pinned
+    SGLang image already contains the compatible DeepSeek-V2/DSA backend, while
+    its Transformers dependency cannot parse that new model type.  Keep the
+    original checkpoint untouched and create a local, symlink-only view with
+    the two metadata adjustments needed by SGLang.  The large safetensors are
+    never copied.
+    """
+    source = Path(model_path)
+    if model_name != "glm_moe_dsa" or not (source / "config.json").is_file():
+        return model_path
+    try:
+        source_config = json.loads((source / "config.json").read_text())
+    except (OSError, ValueError):
+        return model_path
+    if source_config.get("model_type") != "glm_moe_dsa":
+        return model_path
+
+    adapter = Path("/tmp") / f"lightrl-glm51-sglang-{os.getpid()}"
+    adapter.mkdir(parents=True, exist_ok=True)
+    adapted_config = dict(source_config)
+    adapted_config["model_type"] = "deepseek_v2"
+    adapted_config["architectures"] = ["DeepseekV3ForCausalLM"]
+    # DeepseekV2Config (used by the SGLang backend) predates the nested
+    # rope_parameters spelling used by GLM-5.1.
+    rope_parameters = adapted_config.get("rope_parameters")
+    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        adapted_config.setdefault("rope_theta", rope_parameters["rope_theta"])
+    (adapter / "config.json").write_text(json.dumps(adapted_config))
+
+    # AutoTokenizer in the image likewise does not know TokenizersBackend.
+    # Point it at the standard fast-tokenizer implementation while retaining
+    # tokenizer.json and all special-token metadata.
+    tokenizer_config = source / "tokenizer_config.json"
+    if tokenizer_config.is_file():
+        try:
+            tokenizer_data = json.loads(tokenizer_config.read_text())
+            tokenizer_data["tokenizer_class"] = "PreTrainedTokenizerFast"
+            tokenizer_data.pop("backend", None)
+            # Transformers 4.57 interprets this Transformers-5 field as a
+            # mapping (and calls .keys()), while GLM publishes it as a list.
+            # The entries are already present in tokenizer.json, so omitting
+            # the metadata field preserves their ids and avoids that crash.
+            tokenizer_data.pop("extra_special_tokens", None)
+            (adapter / "tokenizer_config.json").write_text(json.dumps(tokenizer_data))
+        except (OSError, ValueError):
+            pass
+
+    # The loader uses the safetensors index and tokenizer files by basename.
+    # Symlink every regular file needed from the immutable shared snapshot.
+    for item in source.iterdir():
+        if item.name in {"config.json", "tokenizer_config.json"}:
+            continue
+        target = adapter / item.name
+        if target.exists() or target.is_symlink():
+            continue
+        try:
+            target.symlink_to(item)
+        except OSError:
+            # A concurrent actor may have created the link in the meantime.
+            if not target.exists() and not target.is_symlink():
+                raise
+    return str(adapter)
 
 
 def get_base_gpu_id(args, rank):
@@ -65,12 +135,37 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def _launch_server_with_runtime_patches(server_args: ServerArgs) -> None:
+    """Launch SGLang after applying per-run compatibility knobs.
+
+    SGLang's model-loader uses a module-level 300-second monitored-barrier
+    timeout (rather than a ``ServerArgs`` field).  GLM-5.1 is spread over
+    hundreds of safetensor shards on shared storage, so the slowest rank can
+    legitimately take longer than that while all ranks still load correctly.
+    Apply an opt-in timeout in the spawned child so the parent/Ray actor does
+    not need to modify the container's SGLang installation.
+    """
+    timeout = os.environ.get("SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT")
+    if timeout:
+        try:
+            from sglang.srt.model_executor import model_runner
+
+            model_runner.UNBALANCED_MODEL_LOADING_TIMEOUT_S = int(timeout)
+        except (ImportError, TypeError, ValueError):
+            # Keep the image's default behavior when running an older SGLang
+            # build that does not expose this constant.
+            logger.warning("Unable to override SGLang model-loading timeout=%s", timeout)
+
     from sglang.srt.entrypoints.http_server import launch_server
+
+    launch_server(server_args)
+
+
+def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_launch_server_with_runtime_patches, args=(server_args,))
     p.start()
 
     if server_args.node_rank != 0:
@@ -130,6 +225,18 @@ class SGLangEngine(RayActor):
         base_gpu_id: int | None = None,
         engine_role: str = "rollout",
     ):
+        # RJob's NVIDIA runtime records the per-replica allocation in
+        # NVIDIA_VISIBLE_DEVICES.  The rollout actor runtime intentionally
+        # sets RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 because SGLang
+        # needs to launch child processes across a multi-node engine.  In a
+        # private RJob, however, leaving CUDA_VISIBLE_DEVICES empty exposes
+        # every physical GPU on the host and sibling replicas can collide on
+        # local ordinal 0/1.  Restore the pod-local UUID mask dynamically in
+        # each actor (rather than serializing rank-0's mask in Ray's runtime
+        # environment).
+        if not os.environ.get("CUDA_VISIBLE_DEVICES") and os.environ.get("NVIDIA_VISIBLE_DEVICES"):
+            os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["NVIDIA_VISIBLE_DEVICES"]
+            logger.info("Using RJob GPU mask CUDA_VISIBLE_DEVICES=%s", os.environ["CUDA_VISIBLE_DEVICES"])
         self.args = args
         self.rank = rank
         self.worker_type = worker_type
@@ -208,7 +315,23 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        server_args = ServerArgs(**server_args_dict)
+        # DeepSeek/GLM NSA automatically enables one DP-attention scheduler
+        # per TP rank.  That is useful for production throughput, but each
+        # scheduler keeps a sizeable CPU-side checkpoint view while loading;
+        # on a constrained RJob this multiplies the already resident
+        # Megatron actor copies and trips Ray's node-memory watchdog.  Allow a
+        # smoke job to retain TP/EP sharding while using a single scheduler.
+        if os.environ.get("SGLANG_DISABLE_NSA_DP_ATTENTION") == "1" and server_args.enable_dp_attention:
+            logger.warning(
+                "Disabling NSA DP attention for constrained smoke "
+                "(dp_size=%s -> 1); TP/EP sharding is unchanged",
+                server_args.dp_size,
+            )
+            server_args.enable_dp_attention = False
+            server_args.enable_dp_lm_head = False
+            server_args.dp_size = 1
+        self.process = launch_server_process(server_args)
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
@@ -518,17 +641,36 @@ def _compute_server_args(
     is_prm = engine_role == "prm"
     gpus_per_engine = args.prm_num_gpus_per_engine if is_prm else args.rollout_num_gpus_per_engine
     model_path = args.prm_model_path if is_prm else args.hf_checkpoint
+    if not is_prm:
+        model_path = _prepare_glm51_sglang_model_path(model_path, getattr(args, "model_name", None))
 
     nnodes = max(1, gpus_per_engine // args.num_gpus_per_node)
     node_rank = rank % nnodes
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
-    base = _to_local_gpu_id(base)
+    # Ray placement probing reports a single logical GPU sequence across all
+    # RJob replicas (e.g. 0..23 for a 3-node/8-GPU allocation).  Inside an
+    # RJob pod, however, NVIDIA_VISIBLE_DEVICES is a UUID mask containing only
+    # that pod's eight devices.  A rollout actor therefore cannot address the
+    # global offsets 8 or 16; derive the local engine offset from its rank.
+    # This also preserves the normal numeric-CUDA_VISIBLE_DEVICES path, where
+    # the placement probe's physical ids are meaningful.
+    cvd_tokens = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+    if base_gpu_id is not None and cvd_tokens:
+        try:
+            int(cvd_tokens[0])
+        except ValueError:
+            base = get_base_gpu_id(args, rank)
     if nnodes > 1:
         # Each part of a multi-node engine owns its node's local GPU range:
         # sglang maps tp_rank to node-local ordinals via tp_size_per_node, so a
         # global bundle offset would double-count and exceed the local device
-        # count (observed as CUDA "invalid device ordinal").
+        # count (observed as CUDA "invalid device ordinal").  Apply this
+        # before translating UUID-based CVD masks: placement-group offsets are
+        # physical/global ordinals and are intentionally not present in a
+        # pod-local UUID list.
         base = 0
+    else:
+        base = _to_local_gpu_id(base)
     kwargs = {
         "model_path": model_path,
         "trust_remote_code": True,
@@ -554,6 +696,14 @@ def _compute_server_args(
         # always enable draft weights cpu backup so that we run training without mtp weights.
         "enable_draft_weights_cpu_backup": True,
     }
+
+    # The default safetensors mmap path leaves a large file-backed working set
+    # resident in every SGLang scheduler.  On a colocated RJob those pages are
+    # charged to each process by Ray's node-memory monitor even though they are
+    # shared by the kernel.  Allow constrained smoke tests to request direct
+    # reads so the loader can release the temporary buffers after each shard.
+    if os.environ.get("SGLANG_WEIGHT_LOADER_DISABLE_MMAP") == "1":
+        kwargs["weight_loader_disable_mmap"] = True
 
     if worker_type == "prefill" and not is_prm:
         kwargs["disaggregation_mode"] = "prefill"

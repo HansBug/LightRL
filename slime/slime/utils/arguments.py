@@ -2008,14 +2008,27 @@ def slime_validate_args(args):
             args.offload_train = True
         if args.offload_rollout is None:
             args.offload_rollout = True
-        if args.rollout_num_gpus != args.actor_num_gpus_per_node * args.actor_num_nodes:
-            logger.info(
-                f"rollout_num_gpus {args.rollout_num_gpus} != actor_num_gpus_per_node {args.actor_num_gpus_per_node} "
-                f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor_num_gpus_per_node * actor_num_nodes."
-            )
-            args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
-            if args.use_critic:
-                args.rollout_num_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
+        colocate_cluster_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes
+        if args.use_critic:
+            colocate_cluster_gpus += args.critic_num_gpus_per_node * args.critic_num_nodes
+        if args.rollout_num_gpus != colocate_cluster_gpus:
+            # Normally colocated training and rollout use the same number of
+            # GPUs.  A large model may nevertheless need a wider TP rollout
+            # engine on only a subset of the training nodes (for example a
+            # TP16 SGLang engine on a 3-node/24-GPU Megatron allocation).  An
+            # explicit opt-in keeps that useful smoke-test topology possible
+            # without silently changing the production invariant.
+            if os.environ.get("SLIME_ALLOW_COLOCATE_ROLLOUT_GPU_MISMATCH", "0") == "1":
+                logger.info(
+                    f"colocate rollout GPU override enabled: rollout_num_gpus={args.rollout_num_gpus}, "
+                    f"training_cluster_gpus={colocate_cluster_gpus}"
+                )
+            else:
+                logger.info(
+                    f"rollout_num_gpus {args.rollout_num_gpus} != actor_num_gpus_per_node {args.actor_num_gpus_per_node} "
+                    f"* actor_num_nodes {args.actor_num_nodes}, overriding rollout_num_gpus to match actor/critic GPUs."
+                )
+                args.rollout_num_gpus = colocate_cluster_gpus
 
     if args.offload_train is None:
         args.offload_train = False

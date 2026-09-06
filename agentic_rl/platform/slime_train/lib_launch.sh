@@ -405,24 +405,47 @@ if [[ "${FORMAL_CAPTURE_SOURCE_STATE:-0}" == "1" ]]; then
     --run-dir "${RUN_DIR}"
 fi
 
-# ── Start Ray head ───────────────────────────────────────────────────
-log "ray start --head ..."
-ray start --head \
-  --node-ip-address "${NODE_IP}" \
-  --num-gpus "${NUM_GPUS}" \
-  --disable-usage-stats \
-  --dashboard-host=0.0.0.0 \
-  --dashboard-port=8265 \
-  --temp-dir "${RAY_TMPDIR}"
+# ── Start (or reuse) Ray head ───────────────────────────────────────
+# A multi-pod RJob must attach its workers after the head exists.  The normal
+# single-pod workflow starts the head here; constrained distributed smokes can
+# pre-start a head and all workers, then set SLIME_SKIP_RAY_START=1 so this
+# helper does not replace the cluster and strand the already-attached workers.
+if [[ "${SLIME_SKIP_RAY_START:-0}" != "1" ]]; then
+  log "ray start --head ..."
+  RAY_START_ARGS=(
+    --head
+    --node-ip-address "${NODE_IP}"
+    --num-gpus "${NUM_GPUS}"
+    --disable-usage-stats
+    --dashboard-host=0.0.0.0
+    --dashboard-port=8265
+    --temp-dir "${RAY_TMPDIR}"
+  )
+  # Placement-group bundles reserve one CPU alongside each GPU.  Small RJobs
+  # may therefore have no schedulable CPU left for the RolloutManager actor
+  # (which requests one CPU outside the placement group).  Allow smoke/debug
+  # callers to advertise a modest Ray CPU overcommit without changing the RJob
+  # resource request; the default remains Ray's detected CPU count.
+  if [[ -n "${RAY_NUM_CPUS:-}" ]]; then
+    RAY_START_ARGS+=(--num-cpus "${RAY_NUM_CPUS}")
+  fi
+  ray start "${RAY_START_ARGS[@]}"
+else
+  log "SLIME_SKIP_RAY_START=1; reusing existing Ray head at ${MASTER_ADDR}:6379"
+fi
 
 log "Waiting for Ray dashboard http://${MASTER_ADDR}:8265 ..."
-for i in {1..40}; do
-  if curl -fsS --max-time 3 "http://${MASTER_ADDR}:8265/api/version" >/dev/null 2>&1; then
-    log "Ray dashboard ready (attempt $i)"
-    break
-  fi
-  sleep 3
-done
+if [[ "${SLIME_DIRECT_TRAIN:-0}" == "1" && "${SLIME_SKIP_RAY_START:-0}" == "1" ]]; then
+  log "Direct Ray mode with reused head; skipping dashboard readiness probe"
+else
+  for i in {1..40}; do
+    if curl -fsS --max-time 3 "http://${MASTER_ADDR}:8265/api/version" >/dev/null 2>&1; then
+      log "Ray dashboard ready (attempt $i)"
+      break
+    fi
+    sleep 3
+  done
+fi
 
 # ── Build runtime env ────────────────────────────────────────────────
 # Only add import roots. Adding ${SCRIPT_DIR} (the agentic_rl package directory)
@@ -509,6 +532,18 @@ RUNTIME_ENV_JSON="{
     \"SLIME_SKIP_ZERO_TRAINABLE_TRAIN\": \"${SLIME_SKIP_ZERO_TRAINABLE_TRAIN}\",
     \"SETA_EXECUTION_PROFILE\": \"${SETA_EXECUTION_PROFILE:-legacy}\",
     \"SGLANG_SERVER_CONCURRENCY\": \"${SGLANG_SERVER_CONCURRENCY:-}\",
+    \"SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS\": \"${SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS:-0}\",
+    \"SGLANG_USE_MESSAGE_QUEUE_BROADCASTER\": \"${SGLANG_USE_MESSAGE_QUEUE_BROADCASTER:-1}\",
+    \"SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT\": \"${SGLANG_UNBALANCED_MODEL_LOADING_TIMEOUT:-}\",
+    \"SGLANG_GLM51_SAFE_MLA_CONCAT\": \"${SGLANG_GLM51_SAFE_MLA_CONCAT:-0}\",
+    \"SGLANG_DISABLE_NSA_DP_ATTENTION\": \"${SGLANG_DISABLE_NSA_DP_ATTENTION:-0}\",
+    \"LIGHTRL_RETRY_CUDA_ALLOC\": \"${LIGHTRL_RETRY_CUDA_ALLOC:-0}\",
+    \"GLM_LEGACY_GROUPED_GEMM\": \"${GLM_LEGACY_GROUPED_GEMM:-0}\",
+    \"GLM_CPU_INITIALIZATION\": \"${GLM_CPU_INITIALIZATION:-0}\",
+    \"GLM_TIE_WORD_EMBEDDINGS\": \"${GLM_TIE_WORD_EMBEDDINGS:-0}\",
+    \"LIGHTRL_BRIDGE_MEMORY_EFFICIENT\": \"${LIGHTRL_BRIDGE_MEMORY_EFFICIENT:-0}\",
+    \"LIGHTRL_BRIDGE_CPU_STAGING\": \"${LIGHTRL_BRIDGE_CPU_STAGING:-0}\",
+    \"LIGHTRL_DEBUG_BRIDGE_WEIGHTS\": \"${LIGHTRL_DEBUG_BRIDGE_WEIGHTS:-0}\",
     \"SLIME_USE_FAULT_TOLERANCE\": \"${SLIME_USE_FAULT_TOLERANCE:-0}\",
     \"SLIME_SAVE_DEBUG_ROLLOUT_DATA\": \"${SLIME_SAVE_DEBUG_ROLLOUT_DATA:-}\",
     \"MASTER_ADDR\": \"${MASTER_ADDR}\",
@@ -740,6 +775,37 @@ run_case_study_if_requested() {
     log "Case-study analysis failed; training exit status is unchanged"
   fi
 }
+
+if [[ "${SLIME_DIRECT_TRAIN:-0}" == "1" ]]; then
+  # Ray Jobs depends on the dashboard HTTP service.  Some RJob deployments
+  # intentionally run a GCS-only Ray head (or have an external process
+  # supervisor that reaps the dashboard), while the training process itself
+  # can connect directly to the existing cluster through RAY_ADDRESS.  Keep a
+  # direct synchronous path for these constrained smoke tests; it still uses
+  # the same train.py entrypoint and Ray placement groups, and mirrors output
+  # into the normal run log.
+  log "SLIME_DIRECT_TRAIN=1; running ${SLIME_ENTRYPOINT} directly against Ray ${RAY_ADDRESS:-unset}"
+  set +e
+  PYTHONPATH="${RUNTIME_PYTHONPATH}:${PYTHONPATH:-}" \
+    "${TRAIN_PYTHON}" -u "${SLIME_ENTRYPOINT}" "${TRAIN_ARGS[@]}" 2>&1 | tee -a "${RUN_LOG}"
+  RAY_LOG_EXIT=${PIPESTATUS[0]}
+  set -e
+  if [[ "${RAY_LOG_EXIT}" == "0" ]]; then
+    run_case_study_if_requested success
+    log "Direct Ray training succeeded"
+    exit 0
+  fi
+  log "Direct Ray training failed (exit: ${RAY_LOG_EXIT}). Writing condensed artifacts..."
+  tail -n 300 "${RUN_LOG}" > "${GPU_TAIL_LOG}" 2>/dev/null || true
+  grep -E "Error|Exception|Traceback|CUDA|OOM|invalid device|FAILED|CheckpointException|ENOSPC|PermissionError|Connect call failed|ConnectorError|500|502" \
+       "${RUN_LOG}" 2>/dev/null \
+    | grep -v "FutureWarning" \
+    | grep -v "DeprecationWarning" \
+    | tail -n 200 \
+    > "${GPU_ERR_LOG}" 2>/dev/null || true
+  run_case_study_if_requested failure
+  exit "${RAY_LOG_EXIT}"
+fi
 
 log "Submitting Ray job ${RAY_JOB_SUBMISSION_ID}"
 RAY_SUBMIT_XTRACE_WAS_ON=0

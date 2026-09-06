@@ -5,6 +5,7 @@ from slime.utils.misc import chunk_named_params_by_size
 
 from ..megatron_to_hf import postprocess_hf_param
 from ..misc_utils import strip_param_name_prefix
+from ..bridge_compat import bridge_from_pretrained
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
 
@@ -12,13 +13,30 @@ class HfWeightIteratorBridge(HfWeightIteratorBase):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        from megatron.bridge import AutoBridge
-
         import slime_plugins.megatron_bridge  # noqa: F401
 
-        self._bridge = AutoBridge.from_hf_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+        self._bridge = bridge_from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
 
     def get_hf_weight_chunks(self, megatron_local_weights):
+        # mbridge's exporter already performs TP/PP gathering and returns
+        # Hugging Face names; the newer megatron.bridge exporter below uses a
+        # conversion-task API instead.
+        if not hasattr(self._bridge, "get_conversion_tasks"):
+            named_weights = (
+                (
+                    hf_param_name,
+                    postprocess_hf_param(
+                        args=self.args,
+                        megatron_param_name=hf_param_name,
+                        hf_param_name=hf_param_name,
+                        param=param,
+                    ),
+                )
+                for hf_param_name, param in self._bridge.export_weights(self.model)
+            )
+            yield from chunk_named_params_by_size(named_weights, chunk_size=self.args.update_weight_buffer_size)
+            return
+
         # TODO support quantization (e.g. modify megatron-bridge to provide megatron param name)
         renamed_megatron_local_weights = {strip_param_name_prefix(k): v for k, v in megatron_local_weights.items()}
         with megatron_bridge_utils.patch_megatron_model(self.model):
