@@ -3,11 +3,79 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+from types import SimpleNamespace
 from typing import Any
 
 from slime.utils.misc import load_function
 
 logger = logging.getLogger(__name__)
+
+_PREFLIGHT_STATE: dict[str, Any] = {}
+
+
+def _preflight_strict() -> bool:
+    return os.environ.get("LWM_TARGET_PROVIDER_STRICT", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def preflight_world_model_target_provider(args: Any, provider_path: str) -> None:
+    """Exercise the target provider once so misconfiguration fails fast.
+
+    A ``latent_wm`` arm whose provider cannot produce targets silently degrades
+    into a plain baseline while burning the same cluster budget.  Running the
+    provider on a dummy sample at the first attach call surfaces missing
+    checkpoints (``LWM_TARGET_CHECKPOINT``), unloadable encoders, and import
+    errors at rollout 0 instead of mid-run.  Strictness is controlled with
+    ``LWM_TARGET_PROVIDER_STRICT`` (default ``1`` = raise; ``0`` = log and
+    continue without targets).
+    """
+    if _PREFLIGHT_STATE.get(provider_path):
+        return
+    provider = load_function(provider_path)
+    record = {
+        "schema": "openclaw_terminal_latent_world_model_v2",
+        "next_observation_text": "world-model provider preflight probe",
+        "feedback_text": "world-model provider preflight probe",
+    }
+    dummy = SimpleNamespace(metadata={"world_model": record}, train_metadata={})
+    try:
+        provided = provider(
+            args=args,
+            samples=[dummy],
+            turn_records=[],
+            task_meta={},
+            run_ctx=None,
+        )
+        if provided is None:
+            target = (dummy.metadata.get("world_model") or {}).get("target_latents")
+        else:
+            target = provided[0] if provided else None
+        if target is None:
+            raise RuntimeError("provider produced no target for the preflight probe sample")
+    except Exception as exc:
+        message = (
+            f"world-model target provider {provider_path} failed its preflight probe: "
+            f"{type(exc).__name__}: {exc}. The latent_wm arm would receive no targets. "
+            "Fix the provider configuration (e.g. LWM_TARGET_CHECKPOINT / "
+            "LWM_TARGET_ENCODER_MODEL) or set LWM_TARGET_PROVIDER_STRICT=0 to "
+            "degrade to no-target operation with a loud log instead."
+        )
+        if _preflight_strict():
+            # Do not mark the probe as done: every attach retries it, so a
+            # broken provider keeps failing fast instead of silently degrading
+            # to a no-target baseline on driver retries.
+            raise RuntimeError(message) from exc
+        # Non-strict mode degrades once; skip future probes to avoid log spam.
+        _PREFLIGHT_STATE[provider_path] = True
+        logger.error("%s", message)
+    else:
+        _PREFLIGHT_STATE[provider_path] = True
+        logger.info("world-model target provider %s passed preflight probe", provider_path)
 
 
 def is_world_model_enabled(args: Any) -> bool:
@@ -207,6 +275,24 @@ def build_terminal_world_model_record(
     }
 
 
+def _build_turn_index(turn_records: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Index turn records by every turn_idx they cover.
+
+    Besides the record's own ``turn_idx``, a record also covers the sub-turn
+    indices listed in ``sdk_model_turns`` — per-interaction samples carry those
+    indices, and without them the lookup silently drops every sample that does
+    not come from a turn's final model interaction.
+    """
+    index: dict[int, dict[str, Any]] = {}
+    for i, turn in enumerate(turn_records or []):
+        primary = int(turn.get("turn_idx", i))
+        index.setdefault(primary, turn)
+        for sub in turn.get("sdk_model_turns") or []:
+            if isinstance(sub, dict) and sub.get("turn_idx") is not None:
+                index.setdefault(int(sub["turn_idx"]), turn)
+    return index
+
+
 def attach_terminal_world_model_metadata(
     *,
     args: Any,
@@ -221,14 +307,26 @@ def attach_terminal_world_model_metadata(
     if not is_world_model_enabled(args) or not samples:
         return
     max_chars = int(getattr(args, "world_model_metadata_max_chars", 4096) or 4096)
-    turn_by_idx = {int(turn.get("turn_idx", i)): turn for i, turn in enumerate(turn_records or [])}
+    turn_by_idx = _build_turn_index(turn_records)
+    matched = 0
+    fallback = 0
+    missed = 0
     for sample in samples:
         metadata = sample.metadata if isinstance(getattr(sample, "metadata", None), dict) else {}
         sample.metadata = metadata
         turn_idx = int(metadata.get("turn_idx", 0) or 0)
         turn = turn_by_idx.get(turn_idx)
+        if turn is None and turn_records:
+            # Positional fallback: clamp to the nearest recorded turn so the
+            # sample still carries an observation instead of being silently
+            # skipped (a missing record zeroes that sample's aux supervision).
+            fallback_idx = min(max(turn_idx, 0), len(turn_records) - 1)
+            turn = turn_records[fallback_idx]
+            fallback += 1
         if turn is None:
+            missed += 1
             continue
+        matched += 1
         record = build_terminal_world_model_record(
             sample=sample,
             turn=turn,
@@ -244,18 +342,40 @@ def attach_terminal_world_model_metadata(
         train_metadata = dict(sample.train_metadata or {})
         train_metadata["world_model"] = record
         sample.train_metadata = train_metadata
+    if fallback or missed:
+        logger.warning(
+            "world-model metadata attach coverage: matched=%d/%d samples (fallback=%d, missed=%d)",
+            matched,
+            len(samples),
+            fallback,
+            missed,
+        )
 
     provider_path = getattr(args, "world_model_target_provider_path", None)
     if not provider_path:
         return
+    preflight_world_model_target_provider(args, provider_path)
     provider = load_function(provider_path)
-    provided = provider(
-        args=args,
-        samples=samples,
-        turn_records=turn_records,
-        task_meta=task_meta,
-        run_ctx=run_ctx,
-    )
+    try:
+        provided = provider(
+            args=args,
+            samples=samples,
+            turn_records=turn_records,
+            task_meta=task_meta,
+            run_ctx=run_ctx,
+        )
+    except Exception as exc:
+        # A broken provider (missing checkpoint/env, encoder OOM, ...) must not
+        # turn otherwise healthy rollouts into generate failures.  Degrade to
+        # no-target for this batch and make the failure loud instead; use the
+        # provider preflight for a startup-time hard check.
+        logger.error(
+            "world-model target provider %s failed for this batch; continuing without targets: %s: %s",
+            provider_path,
+            type(exc).__name__,
+            exc,
+        )
+        return
     if provided is None:
         # A provider may mutate sample.metadata directly.  This is useful when
         # it keeps a resident frozen encoder and avoids copying large tensors.
@@ -265,11 +385,19 @@ def attach_terminal_world_model_metadata(
             "world-model target provider must return one latent payload per sample "
             "or mutate sample.metadata and return None"
         )
+    attached = 0
     for sample, target in zip(samples, provided, strict=True):
         world_model = sample.metadata.setdefault("world_model", {})
         if target is not None:
             world_model["target_latents"] = target
+            attached += 1
         train_metadata = dict(sample.train_metadata or {})
         train_metadata["world_model"] = world_model
         sample.train_metadata = train_metadata
     logger.info("Attached frozen latent WM targets with provider=%s", provider_path)
+    if attached == 0:
+        logger.warning(
+            "world-model target provider %s returned targets for 0/%d samples",
+            provider_path,
+            len(samples),
+        )

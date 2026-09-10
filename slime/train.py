@@ -21,6 +21,7 @@ def _looks_like_env_storm(exc: Exception) -> bool:
         marker in text
         for marker in (
             "dynamic sampling aborted after repeated all-failed rollout groups",
+            "dynamic sampling timed out before collecting enough kept groups",
             "TASK_SLOTS_EXHAUSTED",
             "ALL_WORKERS_UNAVAILABLE_OR_PRESSURED",
             "/allocate",

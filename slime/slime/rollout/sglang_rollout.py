@@ -89,6 +89,36 @@ def _dynamic_sampling_max_seconds(args: Namespace) -> float | None:
     return value if value > 0 else None
 
 
+def _rollout_generation_max_seconds(args: Namespace) -> float | None:
+    """Last-resort wall-clock bound for one rollout generation round.
+
+    Applies when ``dynamic_sampling_max_seconds`` is unset so a generation
+    round can never wait forever on a group task that fails to resolve (e.g.
+    during an environment pool wedge).  Disabled with a non-positive value.
+    """
+    raw = getattr(args, "rollout_generation_max_seconds", None)
+    if raw is None:
+        raw = 2400.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 2400.0
+    return value if value > 0 else None
+
+
+def _rollout_generation_watchdog_seconds(args: Namespace) -> float:
+    """Interval for stall diagnostics while a rollout round is waiting."""
+    raw = getattr(args, "rollout_generation_watchdog_seconds", None)
+    if raw is None:
+        raw = 300.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    return value if value > 0 else 300.0
+
+
+
 def _rollout_abort_wait_timeout(args: Namespace) -> float:
     raw = getattr(args, "rollout_abort_wait_timeout", None)
     if raw is None:
@@ -137,6 +167,17 @@ def _should_abort_for_failed_rollout_groups(
     if failed_groups <= 0:
         return False
     return failed_groups / completed_groups >= ratio
+
+
+def _should_fail_all_failed_round(*, kept_groups: int, failed_groups: int) -> bool:
+    """Whether a completed collection round carries no trainable signal.
+
+    Every kept group being all-failed means the round is pure zero-variance
+    garbage (typical during an environment pool outage); the caller fails the
+    round so the driver's storm-aware retry waits for recovery instead of
+    training on it.
+    """
+    return kept_groups > 0 and failed_groups == kept_groups
 
 
 def _format_dynamic_sampling_state(
@@ -721,6 +762,12 @@ async def generate_rollout_async(
     target_data_size = args.rollout_batch_size
     max_groups = _dynamic_sampling_max_groups(args, target_data_size)
     max_seconds = _dynamic_sampling_max_seconds(args)
+    if max_seconds is None:
+        # Without an explicit dynamic-sampling budget, fall back to a
+        # last-resort round deadline so a group task that never resolves turns
+        # into a retried/loud failure instead of an indefinite hang.
+        max_seconds = _rollout_generation_max_seconds(args)
+    watchdog_seconds = _rollout_generation_watchdog_seconds(args)
     failed_group_abort_min_groups = _dynamic_sampling_failed_group_abort_min_groups(args, target_data_size)
     failed_group_abort_ratio = _dynamic_sampling_failed_group_abort_ratio(args)
     deadline = time.monotonic() + max_seconds if max_seconds is not None else None
@@ -805,31 +852,61 @@ async def generate_rollout_async(
             timeout = None
             if deadline is not None:
                 timeout = max(0.0, deadline - time.monotonic())
+            wait_timeout = timeout
+            if watchdog_seconds > 0:
+                wait_timeout = min(wait_timeout, watchdog_seconds) if wait_timeout is not None else watchdog_seconds
             done, state.pendings = await asyncio.wait(
                 state.pendings,
-                timeout=timeout,
+                timeout=wait_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
-                reason = "dynamic sampling timed out before collecting enough kept groups"
-                details = _format_dynamic_sampling_state(
-                    rollout_id=rollout_id,
-                    target_data_size=target_data_size,
-                    submitted_groups=submitted_groups,
-                    completed_groups=completed_groups,
-                    kept_groups=kept_groups,
-                    dropped_groups=dropped_groups,
-                    removed_groups=removed_groups,
-                    failed_groups=failed_groups,
-                    failed_samples=failed_samples,
-                    removed_samples=removed_samples,
-                    pending_groups=len(state.pendings),
-                    max_groups=max_groups,
-                    max_seconds=max_seconds,
-                    failed_group_abort_min_groups=failed_group_abort_min_groups,
-                    failed_group_abort_ratio=failed_group_abort_ratio,
+                if deadline is not None and time.monotonic() >= deadline:
+                    reason = "dynamic sampling timed out before collecting enough kept groups"
+                    details = _format_dynamic_sampling_state(
+                        rollout_id=rollout_id,
+                        target_data_size=target_data_size,
+                        submitted_groups=submitted_groups,
+                        completed_groups=completed_groups,
+                        kept_groups=kept_groups,
+                        dropped_groups=dropped_groups,
+                        removed_groups=removed_groups,
+                        failed_groups=failed_groups,
+                        failed_samples=failed_samples,
+                        removed_samples=removed_samples,
+                        pending_groups=len(state.pendings),
+                        max_groups=max_groups,
+                        max_seconds=max_seconds,
+                        failed_group_abort_min_groups=failed_group_abort_min_groups,
+                        failed_group_abort_ratio=failed_group_abort_ratio,
+                    )
+                    raise RuntimeError(f"{reason}: {details}")
+                # Stall watchdog: a round may legitimately wait on slow env
+                # builds, but silence makes wedges indistinguishable from
+                # healthy progress.  Log the full state every watchdog interval.
+                logger.warning(
+                    "Rollout generation stalled waiting for %d pending group task(s); "
+                    "still waiting (elapsed budget so far is within deadline): %s",
+                    len(state.pendings),
+                    _format_dynamic_sampling_state(
+                        rollout_id=rollout_id,
+                        target_data_size=target_data_size,
+                        submitted_groups=submitted_groups,
+                        completed_groups=completed_groups,
+                        kept_groups=kept_groups,
+                        dropped_groups=dropped_groups,
+                        removed_groups=removed_groups,
+                        failed_groups=failed_groups,
+                        failed_samples=failed_samples,
+                        removed_samples=removed_samples,
+                        pending_groups=len(state.pendings),
+                        max_groups=max_groups,
+                        max_seconds=max_seconds,
+                        failed_group_abort_min_groups=failed_group_abort_min_groups,
+                        failed_group_abort_ratio=failed_group_abort_ratio,
+                    ),
                 )
-                raise RuntimeError(f"{reason}: {details}")
+                continue
 
             for task in done:
                 group: list[Sample] = task.result()
@@ -917,6 +994,31 @@ async def generate_rollout_async(
         raise
 
     pbar.close()
+    if _should_fail_all_failed_round(kept_groups=kept_groups, failed_groups=failed_groups):
+        # Every kept group is all-failed: the round carries no trainable
+        # signal (typical during an environment pool outage).  Fail the round
+        # with the env-storm marker so the driver's storm-aware retry waits
+        # for recovery instead of training on zero-variance garbage.
+        reason = "dynamic sampling aborted after repeated all-failed rollout groups"
+        details = _format_dynamic_sampling_state(
+            rollout_id=rollout_id,
+            target_data_size=target_data_size,
+            submitted_groups=submitted_groups,
+            completed_groups=completed_groups,
+            kept_groups=kept_groups,
+            dropped_groups=dropped_groups,
+            removed_groups=removed_groups,
+            failed_groups=failed_groups,
+            failed_samples=failed_samples,
+            removed_samples=removed_samples,
+            pending_groups=len(state.pendings),
+            max_groups=max_groups,
+            max_seconds=max_seconds,
+            failed_group_abort_min_groups=failed_group_abort_min_groups,
+            failed_group_abort_ratio=failed_group_abort_ratio,
+        )
+        await _cancel_pending_generation_tasks(args, "round collected only all-failed groups")
+        raise RuntimeError(f"{reason}: {details}")
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
         f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
