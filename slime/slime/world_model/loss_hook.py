@@ -33,6 +33,56 @@ def _as_latent_batch(value: Any, *, device: torch.device) -> torch.Tensor | None
     return value
 
 
+def _as_latent_batch_with_presence(
+    value: Any, *, device: torch.device
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Like ``_as_latent_batch`` but tolerates missing per-sample entries.
+
+    Returns ``(dense, presence)`` where ``dense`` has missing rows zero-filled
+    and ``presence`` is a ``(B,)`` float mask with 0.0 for those rows.  This
+    keeps partially-covered micro-batches usable: the per-sample target mask
+    zeroes the missing rows' contribution instead of dropping the loss for the
+    entire micro-batch.  ``(None, None)`` is returned when nothing is present.
+    """
+    if value is None or not isinstance(value, (list, tuple)):
+        return _as_latent_batch(value, device=device), None
+    if not value:
+        return None, None
+    present = [item for item in value if item is not None]
+    if not present:
+        return None, None
+    rows = [
+        item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
+        for item in present
+    ]
+    ref = torch.stack(rows).to(device=device, dtype=torch.float32)
+    if ref.dim() == 1:
+        ref = ref.unsqueeze(0)
+    elif ref.dim() > 2:
+        ref = ref.flatten(start_dim=1, end_dim=-2).mean(dim=1)
+    dense = ref.new_zeros((len(value), ref.size(-1)))
+    presence = torch.zeros(len(value), device=device, dtype=torch.float32)
+    cursor = 0
+    for index, item in enumerate(value):
+        if item is None:
+            continue
+        row = item if isinstance(item, torch.Tensor) else torch.as_tensor(item)
+        row = row.to(device=device, dtype=torch.float32)
+        if row.dim() == 0:
+            row = row.reshape(1)
+        if row.dim() > 1:
+            row = row.flatten(start_dim=0, end_dim=-2).mean(dim=0)
+        if row.numel() != ref.size(-1):
+            # A malformed row must not shift targets between samples; drop it.
+            continue
+        dense[index] = row
+        presence[index] = 1.0
+        cursor += 1
+    if cursor == 0:
+        return None, None
+    return dense, presence
+
+
 def _response_pooled_logits(logits: torch.Tensor, args: Any, batch: Mapping[str, Any]) -> torch.Tensor:
     """Pool policy logits over each response span while retaining gradients.
 
@@ -160,7 +210,7 @@ def default_world_model_loss_hook(
         latent_dim = int(getattr(args, "world_model_latent_dim", 128) or 128)
         pred = pooled.mean(dim=-1, keepdim=True).expand(-1, latent_dim) if projection == "mean" else _hash_project(pooled, latent_dim)
     pred = _as_latent_batch(pred, device=device)
-    target = _as_latent_batch(target, device=device)
+    target, target_presence = _as_latent_batch_with_presence(target, device=device)
     if pred is not None and target is not None:
         if pred.size(0) != target.size(0):
             raise ValueError(f"world-model latent batch mismatch: pred={tuple(pred.shape)} target={tuple(target.shape)}")
@@ -172,6 +222,12 @@ def default_world_model_loss_hook(
         )
         if target_mask is None:
             target_mask = torch.ones_like(per_sample_loss)
+        if target_presence is not None:
+            # Rows without a provider target are zero-filled placeholders; the
+            # presence mask excludes them so a partially-covered micro-batch
+            # still contributes its real samples.
+            target_mask = target_mask * target_presence
+        target_mask = target_mask.clamp(0.0, 1.0)
         aux_loss = (per_sample_loss * target_mask).sum() / target_mask.sum().clamp_min(1.0)
         available = 1.0
     metrics = {

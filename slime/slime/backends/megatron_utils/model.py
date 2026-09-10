@@ -378,6 +378,7 @@ def train_one_step(
             # Optional differentiable latent-world-model supervision.  These
             # keys are absent for the default DAPO path and are fetched lazily
             # only when the world-model hook has been enabled by the caller.
+            "wm_metadata",
             "wm_pred_latents",
             "wm_target_latents",
             "wm_state_latents",

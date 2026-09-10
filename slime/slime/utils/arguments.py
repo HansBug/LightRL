@@ -702,6 +702,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-generation-max-seconds",
+                type=float,
+                default=2400.0,
+                help=(
+                    "Last-resort wall-clock deadline in seconds for one rollout generation round "
+                    "when --dynamic-sampling-max-seconds is unset. A group task that never "
+                    "resolves (e.g. during an environment pool wedge) turns into a retried, "
+                    "loud failure instead of an indefinite hang. Use <=0 to disable."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-generation-watchdog-seconds",
+                type=float,
+                default=300.0,
+                help=(
+                    "While a rollout generation round is waiting on pending group tasks, log the "
+                    "full dynamic-sampling state every this many seconds so stalls are visible "
+                    "in the logs. Use <=0 for the default (300s)."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-health-check-interval",
                 type=float,
                 default=30.0,
