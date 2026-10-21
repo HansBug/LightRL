@@ -1618,8 +1618,17 @@ def plot_run(
     rollout_metrics = parsed["rollout_metrics"]
     train_metrics = parsed["train_metrics"]
     train_diag = _train_step_diagnostics(parsed)
+    has_structured_rollouts = any(
+        record.get("schema") == "terminal_rl.per_dataset_metrics.v1"
+        and record.get("phase") in {"train", "eval"}
+        for record in parsed["structured_metrics"]
+    )
+    has_structured_train = any(
+        record.get("schema") == "terminal_rl.actor_update_metrics.v1"
+        for record in parsed["structured_metrics"]
+    )
 
-    if not rollout_metrics and not train_metrics:
+    if not rollout_metrics and not train_metrics and not has_structured_rollouts and not has_structured_train:
         print("[!] no rollouts or train steps parsed — empty log?")
         summary = _build_summary(parsed, collapse=None, run_name=run_dir.name)
         json_path = out_dir / "summary_stats.json"
