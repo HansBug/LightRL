@@ -22,7 +22,10 @@
 ## 使用
 
 - [harnesses/README.md](harnesses/README.md)——harness 选择与注册。
-- [evaluation/README.md](evaluation/README.md)——评测工具与 SWE-bench 产物导出。
+- [evaluation/README.md](evaluation/README.md)——评测工具、SETA fixed12 协议与
+  SWE-bench 产物导出。
+- [performance/seta_training_efficiency_zh.md](performance/seta_training_efficiency_zh.md)——
+  SETA 训练耗时、GPU 等待瓶颈、slime trace 与高吞吐执行 profile。
 - [../examples/README.md](../examples/README.md)——训练与验证入口清单。
 
 ## 验证记录
@@ -39,3 +42,5 @@
 - [operations/brainctl_rjob_debug_zh.md](operations/brainctl_rjob_debug_zh.md)
 - [operations/cpu_workers.md](operations/cpu_workers.md)
 - [operations/docker_env_server_stability.md](operations/docker_env_server_stability.md)
+- [operations/checkpoint_wandb_storage_zh.md](operations/checkpoint_wandb_storage_zh.md)——
+  tracker 感知的 checkpoint 清理、磁盘满非致命策略与 W&B offline 同步。
