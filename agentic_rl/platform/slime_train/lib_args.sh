@@ -7,6 +7,9 @@ CKPT_ARGS=(
 # Only add --save / --load / --save-interval when checkpointing is enabled
 if [[ -n "${SAVE_CKPT}" ]]; then
   CKPT_ARGS+=(--save "${SAVE_CKPT}" --save-interval "${SAVE_INTERVAL}")
+  if [[ "${SAVE_FIRST_ROLLOUT}" == "1" ]]; then
+    CKPT_ARGS+=(--save-first-rollout)
+  fi
 fi
 if [[ -n "${RESUME_LOAD}" ]]; then
   CKPT_ARGS+=(--load "${RESUME_LOAD}")
@@ -70,7 +73,9 @@ EVAL_ARGS=(
   --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
   --eval-top-p "${EVAL_TOP_P}"
 )
-if [[ -n "${EVAL_PROMPT_DATA:-}" ]]; then
+if [[ -n "${EVAL_CONFIG:-}" ]]; then
+  EVAL_ARGS+=(--eval-config "${EVAL_CONFIG}")
+elif [[ -n "${EVAL_PROMPT_DATA:-}" ]]; then
   EVAL_DATASET_NAME="${EVAL_DATASET_NAME:-seta}"
   EVAL_ARGS+=(--eval-prompt-data "${EVAL_DATASET_NAME}" "${EVAL_PROMPT_DATA}")
 fi
@@ -82,6 +87,13 @@ if [[ -n "${EVAL_FUNCTION_PATH:-}" ]]; then
 fi
 if [[ -n "${EVAL_TEMPERATURE:-}" ]]; then
   EVAL_ARGS+=(--eval-temperature "${EVAL_TEMPERATURE}")
+fi
+if [[ -n "${EVAL_SEED:-}" ]]; then
+  EVAL_ARGS+=(--eval-seed "${EVAL_SEED}")
+fi
+if [[ -n "${EVAL_STEPS:-}" ]]; then
+  read -r -a _EVAL_STEPS_ARRAY <<<"${EVAL_STEPS//,/ }"
+  EVAL_ARGS+=(--eval-steps "${_EVAL_STEPS_ARRAY[@]}")
 fi
 if [[ -n "${EVAL_TOP_K:-}" ]]; then
   EVAL_ARGS+=(--eval-top-k "${EVAL_TOP_K}")
@@ -286,4 +298,3 @@ fi
 
 # NOTE: safety reward params are passed via env vars (RUNTIME_ENV_JSON below),
 # not CLI flags, because slime's argparse rejects unknown flags.
-

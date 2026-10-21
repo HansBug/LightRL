@@ -7,7 +7,7 @@ import wandb
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
-from slime.utils.misc import should_run_periodic_action
+from slime.utils.misc import should_run_periodic_action, should_save_checkpoint
 from slime.utils.rollout_skip import is_skip_train_result
 
 logger = logging.getLogger(__name__)
@@ -146,8 +146,10 @@ def train(args):
     if args.offload_rollout:
         ray.get(rollout_manager.onload_kv.remote())
 
+    explicit_eval_steps = set(args.eval_steps or [])
+
     # special case for eval-only
-    if args.num_rollout == 0 and args.eval_interval is not None:
+    if args.num_rollout == 0 and (args.eval_interval is not None or 0 in explicit_eval_steps):
         _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id=0)))
 
     def offload_train():
@@ -178,8 +180,12 @@ def train(args):
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
-            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
+        if (
+            rollout_id == 0
+            and not args.skip_eval_before_train
+            and (0 in explicit_eval_steps or (args.eval_steps is None and args.eval_interval is not None))
+        ):
+            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(0)))
 
         gen_result = _get_rollout_generation_result(args, rollout_manager, rollout_id)
         rollout_data_ref, pending = _resolve_generation_result(gen_result)
@@ -200,7 +206,13 @@ def train(args):
         else:
             _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_ref)))
 
-        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+        if should_save_checkpoint(
+            rollout_id,
+            args.save_interval,
+            num_rollout_per_epoch,
+            args.num_rollout,
+            args.save_first_rollout,
+        ):
             save(rollout_id)
 
         offload_train()
@@ -210,8 +222,14 @@ def train(args):
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
+        completed_step = rollout_id + 1
+        should_eval = (
+            completed_step in explicit_eval_steps
+            if args.eval_steps is not None
+            else should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch)
+        )
+        if should_eval:
+            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(completed_step)))
 
     ray.get(rollout_manager.dispose.remote())
 

@@ -108,13 +108,29 @@ else
 fi
 RESUME_LOAD="${RESUME_LOAD:-${SAVE_CKPT}}"
 
-# Pre-flight: refuse to start if EXPORT_ROOT has < 80GB free (only when saving).
+# Pre-flight: check the filesystem that will actually receive checkpoints.
+# CKPT_ROOT may intentionally override the legacy EXPORT_ROOT default; probing
+# EXPORT_ROOT in that case can either inspect the wrong disk or abort under
+# set -e when the legacy mount is absent.
 if (( MAX_CKPT_KEEP > 0 )) && [[ "${DRY_RUN}" != "1" ]]; then
-  AVAIL_GB=$(df -BG --output=avail "${EXPORT_ROOT}" 2>/dev/null | tail -1 | tr -dc '0-9')
-  if [[ -n "${AVAIL_GB}" && "${AVAIL_GB}" -lt 80 ]]; then
-    echo "[ERROR] Free space at ${EXPORT_ROOT} is only ${AVAIL_GB}G, need >= 80G"
-    echo "        Clean old ckpts or set EXPORT_ROOT to a larger disk."
-    df -h "${EXPORT_ROOT}" 2>&1 | tail -2
+  CKPT_SPACE_PATH="${CKPT_ROOT}"
+  if [[ ! -d "${CKPT_SPACE_PATH}" ]]; then
+    echo "[ERROR] Checkpoint root does not exist: ${CKPT_SPACE_PATH}" >&2
+    exit 1
+  fi
+  if ! AVAIL_GB_RAW=$(df -BG --output=avail "${CKPT_SPACE_PATH}" 2>/dev/null); then
+    echo "[ERROR] Cannot inspect free space at checkpoint root: ${CKPT_SPACE_PATH}" >&2
+    exit 1
+  fi
+  AVAIL_GB=$(printf '%s\n' "${AVAIL_GB_RAW}" | tail -1 | tr -dc '0-9')
+  if [[ -z "${AVAIL_GB}" ]]; then
+    echo "[ERROR] Cannot parse free space at checkpoint root: ${CKPT_SPACE_PATH}" >&2
+    exit 1
+  fi
+  if [[ "${AVAIL_GB}" -lt 80 ]]; then
+    echo "[ERROR] Free space at ${CKPT_SPACE_PATH} is only ${AVAIL_GB}G, need >= 80G"
+    echo "        Clean old ckpts or set CKPT_ROOT to a larger disk."
+    df -h "${CKPT_SPACE_PATH}" 2>&1 | tail -2
     exit 1
   fi
 fi
@@ -157,4 +173,3 @@ if [[ ! -f "${MODEL_ARGS_PATH}" ]]; then
   exit 1
 fi
 source "${MODEL_ARGS_PATH}"
-

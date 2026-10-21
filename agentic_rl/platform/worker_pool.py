@@ -81,11 +81,22 @@ class WorkerPool:
         run_idle_ttl: int,
         output_root: str,
         default_timeouts: TaskTimeouts,
+        max_total_runs: int | None = None,
         idempotency_ttl: int = 300,
         max_concurrent_closes: int = 8,
     ) -> None:
         self.max_tasks = max_tasks
         self.max_runs_per_task = max_runs_per_task
+        self.max_total_runs = max(
+            1,
+            int(
+                max_total_runs
+                if max_total_runs is not None
+                else _env_int(
+                    "WORKER_MAX_TOTAL_RUNS", max_tasks * max_runs_per_task
+                )
+            ),
+        )
         self.run_idle_ttl = run_idle_ttl
         self.output_root = Path(output_root).resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -121,6 +132,11 @@ class WorkerPool:
         self._closing_tasks: set[asyncio.Task] = set()
         self._closing_task_started: dict[asyncio.Task, float] = {}
         self._closing_task_labels: dict[asyncio.Task, str] = {}
+        # A lease stops being "active" before its asynchronous Docker cleanup
+        # finishes.  Keep a reference-counted reservation until every cleanup
+        # task for that lease is done so replacement allocations cannot exceed
+        # the daemon's finite network address pools during close/reset churn.
+        self._retiring_run_refs: dict[str, int] = {}
         self._force_cleanup_tasks: set[asyncio.Task] = set()
         self._force_cleanup_task_started: dict[asyncio.Task, float] = {}
         self._force_cleanup_task_labels: dict[asyncio.Task, str] = {}
@@ -446,8 +462,16 @@ class WorkerPool:
         await asyncio.gather(task, return_exceptions=True)
 
     def _track_force_cleanup_task(
-        self, task: asyncio.Task[Any], *, label: str
+        self,
+        task: asyncio.Task[Any],
+        *,
+        label: str,
+        retiring_run_ids: tuple[str, ...] = (),
     ) -> None:
+        for run_lease_id in retiring_run_ids:
+            self._retiring_run_refs[run_lease_id] = (
+                self._retiring_run_refs.get(run_lease_id, 0) + 1
+            )
         self._force_cleanup_tasks.add(task)
         self._force_cleanup_task_started[task] = time.time()
         self._force_cleanup_task_labels[task] = label
@@ -456,6 +480,12 @@ class WorkerPool:
             self._force_cleanup_tasks.discard(done_task)
             self._force_cleanup_task_started.pop(done_task, None)
             self._force_cleanup_task_labels.pop(done_task, None)
+            for run_lease_id in retiring_run_ids:
+                remaining = self._retiring_run_refs.get(run_lease_id, 0) - 1
+                if remaining > 0:
+                    self._retiring_run_refs[run_lease_id] = remaining
+                else:
+                    self._retiring_run_refs.pop(run_lease_id, None)
 
         task.add_done_callback(_on_done)
 
@@ -599,6 +629,9 @@ class WorkerPool:
     def _schedule_close(
         self, task_key: str, run_lease_id: str, run_slot: RunSlot, *, reason: str
     ) -> None:
+        self._retiring_run_refs[run_lease_id] = (
+            self._retiring_run_refs.get(run_lease_id, 0) + 1
+        )
         task = asyncio.create_task(
             self._close_run_slot(task_key, run_lease_id, run_slot, reason=reason)
         )
@@ -610,6 +643,11 @@ class WorkerPool:
             self._closing_tasks.discard(done_task)
             self._closing_task_started.pop(done_task, None)
             self._closing_task_labels.pop(done_task, None)
+            remaining = self._retiring_run_refs.get(run_lease_id, 0) - 1
+            if remaining > 0:
+                self._retiring_run_refs[run_lease_id] = remaining
+            else:
+                self._retiring_run_refs.pop(run_lease_id, None)
 
         task.add_done_callback(_on_done)
 
@@ -622,6 +660,7 @@ class WorkerPool:
         self._track_force_cleanup_task(
             task,
             label=f"{reason} leases={','.join(rid for _tk, rid, _slot in slots[:8])}",
+            retiring_run_ids=tuple(rid for _tk, rid, _slot in slots),
         )
 
     def _schedule_close_requested_force_release(
@@ -864,6 +903,20 @@ class WorkerPool:
                             True,
                         )
                         return {"lease_id": run_lease_id, "reused": True}
+
+            # max_tasks limits distinct task keys and max_runs_per_task limits
+            # fan-out for one key, but neither bounds the number of Docker
+            # networks alive across the pool.  Keep a global lease ceiling so
+            # compose cannot exhaust the daemon's finite default address pools.
+            reserved_run_ids = set(self._run_to_task).union(self._retiring_run_refs)
+            if len(reserved_run_ids) >= self.max_total_runs:
+                raise CapacityError(
+                    "TOTAL_RUN_SLOTS_EXHAUSTED",
+                    "Worker at total run capacity: "
+                    f"{len(reserved_run_ids)}/{self.max_total_runs} "
+                    f"(active={len(self._run_to_task)}, "
+                    f"retiring={len(self._retiring_run_refs)})",
+                )
 
             task_slot = self._tasks.get(task_key)
             if task_slot is not None and any(
@@ -1610,12 +1663,18 @@ class WorkerPool:
                 "max_tasks": self.max_tasks,
                 "active_tasks": len(self._tasks),
                 "max_runs_per_task": self.max_runs_per_task,
+                "max_total_runs": self.max_total_runs,
                 "serial_task_ids": sorted(self._serial_task_ids),
                 "task_max_runs_overrides": dict(
                     sorted(self._task_max_runs_overrides.items())
                 ),
                 "auto_serialize_unsafe_compose": self._auto_serialize_unsafe_compose,
                 "total_active_runs": total_runs,
+                "total_retiring_runs": len(self._retiring_run_refs),
+                "total_reserved_runs": len(
+                    set(self._run_to_task).union(self._retiring_run_refs)
+                ),
+                "retiring_run_ids": sorted(self._retiring_run_refs),
                 "in_flight_runs": in_flight_runs,
                 "closing_requested_runs": closing_requested_runs,
                 "reset_quarantined_runs": reset_quarantined_runs,

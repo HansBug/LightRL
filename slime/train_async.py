@@ -7,7 +7,7 @@ import wandb
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
-from slime.utils.misc import should_run_periodic_action
+from slime.utils.misc import should_run_periodic_action, should_save_checkpoint
 from slime.utils.rollout_skip import is_skip_train_result
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,10 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    explicit_eval_steps = set(args.eval_steps or [])
+    if args.start_rollout_id == 0 and 0 in explicit_eval_steps and not args.skip_eval_before_train:
+        _relay_pending_metrics(ray.get(rollout_manager.eval.remote(0)))
+
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     rollout_data_curr_ref = None
@@ -182,7 +186,13 @@ def train(args):
         else:
             _relay_pending_metrics(ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref)))
 
-        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+        if should_save_checkpoint(
+            rollout_id,
+            args.save_interval,
+            num_rollout_per_epoch,
+            args.num_rollout,
+            args.save_first_rollout,
+        ):
             actor_model.save_model(
                 rollout_id,
                 force_sync=rollout_id == args.num_rollout - 1,
@@ -207,8 +217,14 @@ def train(args):
             rollout_data_next_future = None
             actor_model.update_weights()
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
+        completed_step = rollout_id + 1
+        should_eval = (
+            completed_step in explicit_eval_steps
+            if args.eval_steps is not None
+            else should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch)
+        )
+        if should_eval:
+            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(completed_step)))
 
     ray.get(rollout_manager.dispose.remote())
 

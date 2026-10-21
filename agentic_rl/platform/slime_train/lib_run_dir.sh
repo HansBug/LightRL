@@ -65,6 +65,7 @@ fi
 # When enabled, only the latest N checkpoints are kept; older ones are auto-deleted.
 MAX_CKPT_KEEP="${MAX_CKPT_KEEP:-2}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-8}"
+SAVE_FIRST_ROLLOUT="${SAVE_FIRST_ROLLOUT:-0}"
 if [[ "${DEBUG_MODE}" == "1" ]]; then
   if [[ "${DATASET}" == "swesmith" ]]; then
     RUN_NAME="${RUN_NAME:-terminal-rl_${MODEL_TAG}_${NUM_GPUS}gpu_debug_swesmith_${RUN_ALGO_NAME_TAG}_think_harness-${RUN_HARNESS_TAG}_mt${MAX_TURN}_${RUN_TIMESTAMP}}"
@@ -99,10 +100,17 @@ RUN_PATHS_CKPT_ROOT="${CKPT_ROOT}"
 if [[ "${DRY_RUN}" == "1" ]]; then
   RUN_PATHS_CKPT_ROOT="${RUN_DIR}/checkpoints"
 fi
-MAX_CKPT_KEEP="${MAX_CKPT_KEEP}" python3 -m agentic_rl.platform.paths init \
-  --runs-root "${RUNS_ROOT}" \
-  --ckpt-root "${RUN_PATHS_CKPT_ROOT}" \
-  --run-id "${RUN_ID}" > /dev/null
+if [[ "${RESUME_EXISTING_RUN:-0}" == "1" ]]; then
+  [[ -f "${RUN_DIR}/meta.json" ]] || {
+    echo "[ERROR] Resume requested but original run metadata is missing: ${RUN_DIR}/meta.json" >&2
+    exit 1
+  }
+else
+  MAX_CKPT_KEEP="${MAX_CKPT_KEEP}" python3 -m agentic_rl.platform.paths init \
+    --runs-root "${RUNS_ROOT}" \
+    --ckpt-root "${RUN_PATHS_CKPT_ROOT}" \
+    --run-id "${RUN_ID}" > /dev/null
+fi
 
 # Derive all paths from RUN_DIR
 RUN_LOG_DIR="${RUN_DIR}/logs"
@@ -221,4 +229,3 @@ claude_code_preflight() {
     echo "[WARN] claude-code auth env vars are empty. This is OK only if the Claude Code CLI is already authenticated via its own config."
   fi
 }
-

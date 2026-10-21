@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from agentic_rl.platform.types import (
 from agentic_rl.environments.registry import (
     direct_score_source,
     safety_reward_mode,
+    slug_for,
     uses_remote_terminal_env as _uses_remote_terminal_env,
 )
 from agentic_rl.environments.reward_safety import (
@@ -288,15 +290,10 @@ async def _open_env_session(plan: _RunPlan, session: _EnvSession) -> None:
     run_ctx = plan.run_ctx
     _log_tag = plan.log_tag
 
-    session.env_client, session.lease_id = await _create_env_client(
-        _make_task_spec(task_meta), run_ctx, task_meta
-    )
-    reset_kwargs = {
-        "lease_id": session.lease_id,
-        "task_meta": task_meta,
-        "run_ctx": plan.run_ctx_payload,
-        "task_timeouts": plan.timeouts.to_payload(),
-    }
+    # Admission must precede the remote /allocate call.  Acquiring it after
+    # allocation lets every pending rollout consume (or wait for) a worker
+    # lease before the client-side cap applies, so two independent clients can
+    # overrun the worker's shared capacity and time out while retrying 429s.
     if _uses_remote_terminal_env(task_meta):
         open_reason = _task_circuit_open_reason(plan.task_key)
         if open_reason is not None:
@@ -307,6 +304,15 @@ async def _open_env_session(plan: _RunPlan, session: _EnvSession) -> None:
             plan.task_key,
             log_tag=_log_tag,
         )
+    session.env_client, session.lease_id = await _create_env_client(
+        _make_task_spec(task_meta), run_ctx, task_meta
+    )
+    reset_kwargs = {
+        "lease_id": session.lease_id,
+        "task_meta": task_meta,
+        "run_ctx": plan.run_ctx_payload,
+        "task_timeouts": plan.timeouts.to_payload(),
+    }
     default_reset_http_timeout = (
         float(plan.timeouts.ensure_image) + float(plan.timeouts.reset_session) + 300.0
     )
@@ -1015,6 +1021,35 @@ async def _collect_safety_scores(
 # ── Step 7: exploration bonus injection (intrinsic/safety/LP-RND/Agent57/CDE) ──
 
 
+def _agent57_normalized_outcome(
+    samples: List[Sample],
+    data_source: str | None,
+) -> float | None:
+    """Return the task-native [0, 1] outcome used by Agent57's UCB.
+
+    Converted SETA rows deliberately retain ``data_source=terminal_bench`` for
+    reward routing.  Checking only for the literal string ``seta`` therefore
+    silently fed the shaped score (including truncation/overlong penalties)
+    into the controller and classified positive partial credit as failure.
+    Resolve aliases through the environment registry and prefer ``raw_score``.
+    """
+    if slug_for(data_source) != "seta":
+        return None
+    values: list[float] = []
+    for item in samples:
+        if not isinstance(item.reward, dict):
+            continue
+        raw_score = item.reward.get("raw_score", item.reward.get("accuracy"))
+        try:
+            value = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        values.append(min(1.0, max(0.0, value)))
+    return sum(values) / len(values) if values else None
+
+
 def _inject_exploration_bonuses(
     samples: List[Sample],
     *,
@@ -1118,24 +1153,9 @@ def _inject_exploration_bonuses(
     _base_score_mean = (
         sum(_base_score_values) / len(_base_score_values) if _base_score_values else 0.0
     )
-    _agent57_dataset_name = str(data_source or "").strip().lower()
-    _agent57_normalized_score_values = []
-    if _agent57_dataset_name == "seta":
-        for _sample in samples:
-            if not isinstance(_sample.reward, dict):
-                continue
-            _raw_score = _sample.reward.get(
-                "raw_score",
-                _sample.reward.get("accuracy"),
-            )
-            try:
-                _agent57_normalized_score_values.append(float(_raw_score))
-            except (TypeError, ValueError):
-                pass
-    _agent57_normalized_score_mean = (
-        sum(_agent57_normalized_score_values) / len(_agent57_normalized_score_values)
-        if _agent57_normalized_score_values
-        else None
+    _agent57_normalized_score_mean = _agent57_normalized_outcome(
+        samples,
+        data_source,
     )
     _cde_actor = _explore_cde_actor_metrics(
         interactions,
