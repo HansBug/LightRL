@@ -51,8 +51,12 @@ die() { printf '[seta-dapo] ERROR: %s\n' "$*" >&2; exit 1; }
 if [[ "${DRY_RUN}" != "1" ]]; then
   command -v nvidia-smi >/dev/null || die "nvidia-smi is required inside the rjob"
   gpu_count="$(nvidia-smi -L | sed -n '/^GPU /p' | wc -l)"
-  [[ "${gpu_count}" == "${NUM_GPUS}" || "${ALLOW_GPU_COUNT_MISMATCH:-0}" == "1" ]] \
-    || die "expected ${NUM_GPUS} visible GPUs, found ${gpu_count}"
+  # NUM_GPUS is the Ray resource budget, not a claim that the container must
+  # expose exactly that many physical devices.  Dedicated 8-GPU rjobs may run
+  # this 4-GPU recipe; reject only true under-allocation.  Ray is started with
+  # --num-gpus=${NUM_GPUS} and therefore cannot schedule onto the extra GPUs.
+  [[ "${gpu_count}" -ge "${NUM_GPUS}" || "${ALLOW_GPU_COUNT_MISMATCH:-0}" == "1" ]] \
+    || die "requires at least ${NUM_GPUS} visible GPUs, found ${gpu_count}"
   command -v curl >/dev/null || die "curl is required for the worker health check"
   curl --noproxy '*' --fail --silent --show-error --max-time 10 \
     "${WORKER_URLS%%,*}/healthz" >/dev/null \
