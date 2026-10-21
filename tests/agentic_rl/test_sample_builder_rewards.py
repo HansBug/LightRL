@@ -32,6 +32,7 @@ from agentic_rl.rollout.sample_builder import (
     _mark_non_trainable_samples,
     _sync_reward_aliases,
 )
+from agentic_rl.rollout.generate_steps import _agent57_normalized_outcome
 from agentic_rl.algorithms.dive_po.rewards import postprocess
 
 
@@ -110,6 +111,20 @@ def make_base_sample() -> Sample:
     sample.prompt = "task"
     sample.metadata = {}
     return sample
+
+
+def test_agent57_seta_alias_uses_raw_outcome_not_shaped_score():
+    partial = make_base_sample()
+    partial.reward = {"raw_score": 0.5, "score": -1.25}
+    full = make_base_sample()
+    full.reward = {"raw_score": 1.0, "score": 0.2}
+
+    # Converted SETA data routes rewards under the historical terminal_bench
+    # name.  UCB must still see the task-native partial/full credit (mean .75),
+    # not the negative score after overlong/truncation shaping.
+    assert _agent57_normalized_outcome([partial, full], "terminal_bench") == 0.75
+    assert _agent57_normalized_outcome([partial], "seta_env") == 0.5
+    assert _agent57_normalized_outcome([partial], "agentharm") is None
 
 
 def scores(samples):

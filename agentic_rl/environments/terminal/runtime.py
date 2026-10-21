@@ -2155,6 +2155,7 @@ class TerminalEnv:
                 agent_logs_path=self._trial_handler.trial_paths.agent_logging_dir,
                 no_rebuild=True,
                 cleanup=False,
+                disable_recording=task_config.disable_asciinema,
             )
             if namespace != "default":
                 compose_manager = getattr(self._terminal, "_compose_manager", None)
