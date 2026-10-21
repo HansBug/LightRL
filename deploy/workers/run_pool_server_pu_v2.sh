@@ -33,7 +33,7 @@
 #   WORKER_MAX_CONCURRENT_RESETS (default 16) — cap reset admission before image prep
 #   WORKER_DOCKER_BUILD_QUEUE_TIMEOUT (default 90) — fail queued image prep before reset storm
 #   WORKER_PRESSURE_GUARD_ENABLED (default 1) — pids/shim/docker-cli admission guard
-#   CONTAINER_PIDS_LIMIT        (default 64) — docker update --pids-limit per task container
+#   CONTAINER_PIDS_LIMIT        (default 512) — docker update --pids-limit per task container
 #
 # Logs written by default:
 #   runs/<run>/remote_logs/<worker>/<server-run>/cpu_pool.log
@@ -212,8 +212,17 @@ WORKER_DOCKER_BUILD_FAILED_TTL="${WORKER_DOCKER_BUILD_FAILED_TTL:-3600}"
 WORKER_DOCKER_TASK_BLACKLIST_TTL="${WORKER_DOCKER_TASK_BLACKLIST_TTL:-86400}"
 WORKER_DOCKERFILE_PRECHECK="${WORKER_DOCKERFILE_PRECHECK:-1}"
 WORKER_TASK_IMAGE_RETRY_AFTER="${WORKER_TASK_IMAGE_RETRY_AFTER:-300}"
-CONTAINER_PIDS_LIMIT="${CONTAINER_PIDS_LIMIT:-64}"
+CONTAINER_PIDS_LIMIT="${CONTAINER_PIDS_LIMIT:-512}"
 CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT:-16g}"
+if [[ ! "${CONTAINER_PIDS_LIMIT}" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] CONTAINER_PIDS_LIMIT must be a non-negative integer." >&2
+    exit 1
+fi
+visible_cpu_count="$(nproc 2>/dev/null || echo 1)"
+if (( CONTAINER_PIDS_LIMIT > 0 && CONTAINER_PIDS_LIMIT <= visible_cpu_count )); then
+    echo "[ERROR] CONTAINER_PIDS_LIMIT=${CONTAINER_PIDS_LIMIT} must exceed visible CPUs=${visible_cpu_count}; SETA uv graders create a CPU-sized thread pool." >&2
+    exit 1
+fi
 CPU_POOL_LOG_MAX_BYTES="${CPU_POOL_LOG_MAX_BYTES:-209715200}"
 CPU_POOL_LOG_TAIL_BYTES="${CPU_POOL_LOG_TAIL_BYTES:-52428800}"
 CPU_ERR_SCAN_LINES="${CPU_ERR_SCAN_LINES:-5000}"
@@ -759,47 +768,65 @@ export WORKER_TASK_IMAGE_RETRY_AFTER
 export CONTAINER_PIDS_LIMIT
 export CONTAINER_MEMORY_LIMIT
 
-pool_server_env_ok() {
-    local env_dir="$1"
-    [[ -x "${env_dir}/bin/python" ]] || return 1
-    "${env_dir}/bin/python" - <<'PY' >/dev/null 2>&1
-import importlib.util
+pool_server_python_ok() {
+    local python_bin="$1"
+    [[ -x "${python_bin}" ]] || return 1
+    PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+      "${python_bin}" - <<'PY' >/dev/null 2>&1
 import sys
 
 if sys.version_info < (3, 12):
     raise SystemExit(1)
-missing = [
-    name for name in ("terminal_bench", "fastapi", "uvicorn", "camel")
-    if importlib.util.find_spec(name) is None
-]
-raise SystemExit(1 if missing else 0)
+
+# Import the actual worker entrypoint, not only top-level package specs.
+# terminal-bench imports Docker/YAML/harness modules transitively; a partial
+# installation can therefore pass find_spec() and still crash before uvicorn
+# starts (which previously wasted an allocated 8-GPU RJob in a restart loop).
+import agentic_rl.platform.worker_cli  # noqa: F401
+import camel  # noqa: F401
 PY
 }
 
 SHARED_CONDA_POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV:-$(cd "${REPO_ROOT}/.." && pwd)/conda_envs/openclaw-worker-py312}"
-if [[ -z "${POOL_SERVER_VENV:-}" ]] && pool_server_env_ok "${SHARED_CONDA_POOL_SERVER_VENV}"; then
-    POOL_SERVER_VENV="${SHARED_CONDA_POOL_SERVER_VENV}"
-else
-    if [[ -z "${POOL_SERVER_VENV:-}" && -x "${SHARED_CONDA_POOL_SERVER_VENV}/bin/python" ]]; then
-        log "  shared conda env is present but missing pool_server deps: ${SHARED_CONDA_POOL_SERVER_VENV}"
+POOL_SERVER_PYTHON="${POOL_SERVER_PYTHON:-}"
+if [[ -n "${POOL_SERVER_PYTHON}" ]]; then
+    if ! pool_server_python_ok "${POOL_SERVER_PYTHON}"; then
+        echo "[ERROR] explicit POOL_SERVER_PYTHON lacks required worker dependencies: ${POOL_SERVER_PYTHON}" >&2
+        exit 1
     fi
-    POOL_SERVER_VENV="${POOL_SERVER_VENV:-${REPO_ROOT}/.venv}"
+else
+    python_candidates=(
+        "${POOL_SERVER_VENV:+${POOL_SERVER_VENV}/bin/python}"
+        "${SHARED_CONDA_POOL_SERVER_VENV}/bin/python"
+        "${REPO_ROOT}/.venv/bin/python"
+        "$(command -v python3 || command -v python)"
+    )
+    for candidate in "${python_candidates[@]}"; do
+        [[ -n "${candidate}" ]] || continue
+        if pool_server_python_ok "${candidate}"; then
+            POOL_SERVER_PYTHON="${candidate}"
+            break
+        fi
+        if [[ -x "${candidate}" ]]; then
+            log "  rejecting pool_server Python with missing/incompatible deps: ${candidate}"
+        fi
+    done
 fi
+
+if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
+    echo "[ERROR] no compatible pool_server Python found." >&2
+    echo "        Required: Python >=3.12 with a deep-importable worker_cli and camel." >&2
+    echo "        Set POOL_SERVER_PYTHON or POOL_SERVER_VENV to a prepared environment." >&2
+    exit 1
+fi
+
+POOL_SERVER_VENV="${POOL_SERVER_VENV:-$(cd -- "$(dirname -- "${POOL_SERVER_PYTHON}")/.." &>/dev/null && pwd)}"
 
 if [ -f "${POOL_SERVER_VENV}/bin/activate" ]; then
     # shellcheck disable=SC1090
     source "${POOL_SERVER_VENV}/bin/activate"
 else
     export PATH="${POOL_SERVER_VENV}/bin:${PATH}"
-fi
-
-POOL_SERVER_PYTHON="${POOL_SERVER_PYTHON:-}"
-if [[ -z "${POOL_SERVER_PYTHON}" ]]; then
-    if [[ -x "${POOL_SERVER_VENV}/bin/python" ]]; then
-        POOL_SERVER_PYTHON="${POOL_SERVER_VENV}/bin/python"
-    else
-        POOL_SERVER_PYTHON="$(command -v python3 || command -v python)"
-    fi
 fi
 
 log "  pool_server python: ${POOL_SERVER_PYTHON}"
