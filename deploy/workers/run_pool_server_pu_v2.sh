@@ -33,7 +33,7 @@
 #   WORKER_MAX_CONCURRENT_RESETS (default 16) — cap reset admission before image prep
 #   WORKER_DOCKER_BUILD_QUEUE_TIMEOUT (default 90) — fail queued image prep before reset storm
 #   WORKER_PRESSURE_GUARD_ENABLED (default 1) — pids/shim/docker-cli admission guard
-#   CONTAINER_PIDS_LIMIT        (default 64) — docker update --pids-limit per task container
+#   CONTAINER_PIDS_LIMIT        (default 512) — docker update --pids-limit per task container
 #
 # Logs written by default:
 #   runs/<run>/remote_logs/<worker>/<server-run>/cpu_pool.log
@@ -212,8 +212,17 @@ WORKER_DOCKER_BUILD_FAILED_TTL="${WORKER_DOCKER_BUILD_FAILED_TTL:-3600}"
 WORKER_DOCKER_TASK_BLACKLIST_TTL="${WORKER_DOCKER_TASK_BLACKLIST_TTL:-86400}"
 WORKER_DOCKERFILE_PRECHECK="${WORKER_DOCKERFILE_PRECHECK:-1}"
 WORKER_TASK_IMAGE_RETRY_AFTER="${WORKER_TASK_IMAGE_RETRY_AFTER:-300}"
-CONTAINER_PIDS_LIMIT="${CONTAINER_PIDS_LIMIT:-64}"
+CONTAINER_PIDS_LIMIT="${CONTAINER_PIDS_LIMIT:-512}"
 CONTAINER_MEMORY_LIMIT="${CONTAINER_MEMORY_LIMIT:-16g}"
+if [[ ! "${CONTAINER_PIDS_LIMIT}" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] CONTAINER_PIDS_LIMIT must be a non-negative integer." >&2
+    exit 1
+fi
+visible_cpu_count="$(nproc 2>/dev/null || echo 1)"
+if (( CONTAINER_PIDS_LIMIT > 0 && CONTAINER_PIDS_LIMIT <= visible_cpu_count )); then
+    echo "[ERROR] CONTAINER_PIDS_LIMIT=${CONTAINER_PIDS_LIMIT} must exceed visible CPUs=${visible_cpu_count}; SETA uv graders create a CPU-sized thread pool." >&2
+    exit 1
+fi
 CPU_POOL_LOG_MAX_BYTES="${CPU_POOL_LOG_MAX_BYTES:-209715200}"
 CPU_POOL_LOG_TAIL_BYTES="${CPU_POOL_LOG_TAIL_BYTES:-52428800}"
 CPU_ERR_SCAN_LINES="${CPU_ERR_SCAN_LINES:-5000}"

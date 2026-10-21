@@ -144,6 +144,10 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    explicit_eval_steps = set(args.eval_steps or [])
+    if args.start_rollout_id == 0 and 0 in explicit_eval_steps and not args.skip_eval_before_train:
+        _relay_pending_metrics(ray.get(rollout_manager.eval.remote(0)))
+
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     rollout_data_curr_ref = None
@@ -207,8 +211,14 @@ def train(args):
             rollout_data_next_future = None
             actor_model.update_weights()
 
-        if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(rollout_id)))
+        completed_step = rollout_id + 1
+        should_eval = (
+            completed_step in explicit_eval_steps
+            if args.eval_steps is not None
+            else should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch)
+        )
+        if should_eval:
+            _relay_pending_metrics(ray.get(rollout_manager.eval.remote(completed_step)))
 
     ray.get(rollout_manager.dispose.remote())
 
