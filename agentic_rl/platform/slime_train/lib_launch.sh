@@ -192,6 +192,13 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "includes_agentharm": "${INCLUDES_AGENTHARM}",
   "includes_swesmith": "${INCLUDES_SWESMITH}",
   "prompt_data": "${ROLLOUT_PROMPT_DATA}",
+  "eval_protocol": "${EVAL_PROTOCOL:-legacy}",
+  "eval_config": "${EVAL_CONFIG:-}",
+  "eval_seed": "${EVAL_SEED:-}",
+  "eval_steps": "${EVAL_STEPS:-}",
+  "eval_manifest_sha256": "${EVAL_MANIFEST_SHA256:-}",
+  "eval_set_sha256": "${EVAL_SET_SHA256:-}",
+  "train_set_sha256": "${TRAIN_SET_SHA256:-}",
   "swesmith_source_prompt_data": "${SWESMITH_SOURCE_PROMPT_DATA}",
   "swesmith_artifact_sha256": "${SWESMITH_ARTIFACT_SHA256}",
   "swesmith_conversion_mode": "${SWESMITH_CONVERSION_MODE}",
@@ -201,6 +208,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "num_rollout": ${NUM_ROLLOUT},
   "rollout_batch_size": ${ROLLOUT_BATCH_SIZE},
   "n_samples": ${N_SAMPLES},
+  "max_turn": ${MAX_TURN},
   "rollout_max_response_len": ${ROLLOUT_MAX_RESPONSE_LEN},
   "rollout_max_context_len": ${ROLLOUT_MAX_CONTEXT_LEN},
   "rollout_generation_max_retries": "${ROLLOUT_GENERATION_MAX_RETRIES}",
@@ -276,6 +284,7 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "trajectory_save_reward_strata": "${TRAJECTORY_SAVE_REWARD_STRATA}",
   "trajectory_save_log_decisions": "${TRAJECTORY_SAVE_LOG_DECISIONS}",
   "exploration_profile": "${EXPLORATION_PROFILE}",
+  "custom_reward_post_process_path": "${CUSTOM_REWARD_POST_PROCESS_PATH:-}",
   "explore_entropy_coef": "${EXPLORE_ENTROPY_COEF}",
   "explore_think_mode": "${EXPLORE_THINK_MODE}",
   "explore_temp_high": "${EXPLORE_TEMP_HIGH}",
@@ -425,6 +434,12 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "log_dir": "${RUN_LOG_DIR}"
 }
 CFGEOF
+
+if [[ "${FORMAL_CAPTURE_SOURCE_STATE:-0}" == "1" ]]; then
+  log "Capturing formal-run source state..."
+  "${TRAIN_PYTHON}" "${REPO_ROOT}/tools/reproducibility/capture_formal_run_source.py" \
+    --run-dir "${RUN_DIR}"
+fi
 
 # ── Start Ray head ───────────────────────────────────────────────────
 log "ray start --head ..."

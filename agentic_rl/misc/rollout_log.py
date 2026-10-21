@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import os
@@ -1191,6 +1192,16 @@ def _agent57_summary(samples: List[Sample]) -> dict[str, Any]:
         if v is not None
     ]
     trust_stats = _stats(trust_values)
+    sqlite_wait_stats = _stats(
+        [
+            value
+            for value in (
+                _reward_value(sample, "explore_agent57_sqlite_lock_wait_ms")
+                for sample in agent_samples
+            )
+            if value is not None
+        ]
+    )
 
     def status_trust_mean(status_part: str) -> float | None:
         values = [
@@ -1239,6 +1250,15 @@ def _agent57_summary(samples: List[Sample]) -> dict[str, Any]:
         "agent57/lifelong_state_error_rate": (
             state_error_count / count if count else None
         ),
+        "agent57/sqlite_lock_wait_ms_mean": (
+            sqlite_wait_stats["mean"] if sqlite_wait_stats else None
+        ),
+        "agent57/sqlite_lock_wait_ms_p90": (
+            sqlite_wait_stats["p90"] if sqlite_wait_stats else None
+        ),
+        "agent57/sqlite_lock_wait_ms_max": (
+            sqlite_wait_stats["max"] if sqlite_wait_stats else None
+        ),
         "agent57/arm_count": len(arm_counts) if arm_counts else None,
         "agent57/top_arm": float(top_arm) if top_arm is not None else None,
         "agent57/top_arm_ratio": top_arm_ratio,
@@ -1275,6 +1295,9 @@ def _add_agent57_debug_metrics(
         ("agent57/active", "active_rate"),
         ("agent57/lifelong_eligible_rate", "lifelong_eligible_rate"),
         ("agent57/lifelong_state_error_rate", "lifelong_state_error_rate"),
+        ("agent57/sqlite_lock_wait_ms_mean", "sqlite_lock_wait_ms/mean"),
+        ("agent57/sqlite_lock_wait_ms_p90", "sqlite_lock_wait_ms/p90"),
+        ("agent57/sqlite_lock_wait_ms_max", "sqlite_lock_wait_ms/max"),
         ("agent57/arm_count", "arm_count"),
         ("agent57/top_arm", "top_arm"),
         ("agent57/top_arm_ratio", "top_arm_ratio"),
@@ -1547,6 +1570,8 @@ def _step_context(
 
 def _analysis_dataset_name_from_raw(raw_name: Any) -> str:
     name = _sanitize_metric_part(raw_name)
+    if name in {"seta_fixed48_exploit", "seta_fixed48_explore"}:
+        return name
     if name in {"terminal_bench", "seta", "seta_env"}:
         return "seta"
     if name.startswith("seta_"):
@@ -1558,6 +1583,110 @@ def _analysis_dataset_name_from_raw(raw_name: Any) -> str:
     if name in {"safety", "security", "mcpsafety", "harmbench"} or name.startswith("safety"):
         return "security"
     return name
+
+
+def _eval_protocol_summary(samples: list[Sample]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Compute task-level pass@k/diversity without treating k draws as k tasks."""
+    groups: dict[str, list[Sample]] = defaultdict(list)
+    for sample in samples:
+        metadata = _as_dict(getattr(sample, "metadata", None))
+        prompt_index = metadata.get("eval_prompt_index")
+        group_key = f"prompt:{prompt_index}" if prompt_index is not None else _task_identity(sample)
+        groups[group_key].append(sample)
+
+    task_records: list[dict[str, Any]] = []
+    pass_values: list[float] = []
+    best_rewards: list[float] = []
+    unique_ratios: list[float] = []
+    jaccard_distances: list[float] = []
+    group_sizes: list[int] = []
+    for group_key, group in sorted(groups.items()):
+        group.sort(
+            key=lambda sample: int(
+                _as_dict(getattr(sample, "metadata", None)).get("eval_sample_index", 0)
+            )
+        )
+        rewards = [_reward_value(sample, "score") for sample in group]
+        numeric_rewards = [float(value) if value is not None else 0.0 for value in rewards]
+        successes = [value > 0.0 for value in numeric_rewards]
+        responses = [str(getattr(sample, "response", "") or "") for sample in group]
+        response_hashes = [hashlib.sha256(response.encode()).hexdigest() for response in responses]
+        unique_ratio = len(set(response_hashes)) / len(response_hashes) if response_hashes else 0.0
+        pair_distances: list[float] = []
+        token_sets = [set(re.findall(r"\w+|[^\w\s]", response.lower())) for response in responses]
+        for left_index in range(len(token_sets)):
+            for right_index in range(left_index + 1, len(token_sets)):
+                union = token_sets[left_index] | token_sets[right_index]
+                intersection = token_sets[left_index] & token_sets[right_index]
+                pair_distances.append(1.0 - len(intersection) / len(union) if union else 0.0)
+        pair_distance = sum(pair_distances) / len(pair_distances) if pair_distances else 0.0
+        pass_value = float(any(successes))
+        best_reward = max(numeric_rewards, default=0.0)
+        group_sizes.append(len(group))
+        pass_values.append(pass_value)
+        best_rewards.append(best_reward)
+        unique_ratios.append(unique_ratio)
+        jaccard_distances.append(pair_distance)
+        metadata = _as_dict(getattr(group[0], "metadata", None)) if group else {}
+        task_records.append(
+            {
+                "group": group_key,
+                "prompt_index": metadata.get("eval_prompt_index"),
+                "task_id": _task_identity(group[0]) if group else "unknown",
+                "k": len(group),
+                "rewards": numeric_rewards,
+                "successes": successes,
+                "pass_at_k": pass_value,
+                "best_reward_at_k": best_reward,
+                "response_unique_ratio": unique_ratio,
+                "response_pairwise_jaccard_distance": pair_distance,
+                "statuses": [_status_name(sample) for sample in group],
+                "sampling_seeds": [
+                    _as_dict(getattr(sample, "metadata", None)).get("eval_sampling_seed")
+                    for sample in group
+                ],
+                "response_sha256": response_hashes,
+                "responses": responses,
+            }
+        )
+
+    distinct_group_sizes = sorted(set(group_sizes))
+    k = distinct_group_sizes[0] if len(distinct_group_sizes) == 1 else None
+    summary: dict[str, Any] = {
+        "eval/task_count": len(groups),
+        "eval/k": k,
+        "eval/pass_at_k": sum(pass_values) / len(pass_values) if pass_values else None,
+        "eval/reward_best_at_k": sum(best_rewards) / len(best_rewards) if best_rewards else None,
+        "eval/response_unique_ratio": sum(unique_ratios) / len(unique_ratios) if unique_ratios else None,
+        "eval/response_pairwise_jaccard_distance": (
+            sum(jaccard_distances) / len(jaccard_distances) if jaccard_distances else None
+        ),
+    }
+    if k is not None:
+        summary[f"pass_at_{k}"] = summary["eval/pass_at_k"]
+    return summary, task_records
+
+
+def _write_eval_protocol_artifacts(
+    *, dataset_name: str, step: int, summary: dict[str, Any], task_records: list[dict[str, Any]]
+) -> None:
+    run_dir = os.getenv("RUN_DIR", "").strip()
+    if not run_dir:
+        return
+    output_dir = Path(run_dir) / "evaluations" / _sanitize_metric_part(dataset_name) / f"step_{step:04d}"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = output_dir / "summary.json"
+        tasks_path = output_dir / "tasks.jsonl"
+        summary_path.write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with tasks_path.open("w", encoding="utf-8") as handle:
+            for record in task_records:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to write eval protocol artifacts under %s: %s", output_dir, exc)
 
 
 def _analysis_dataset_name(sample: Sample) -> str:
@@ -2763,8 +2892,12 @@ def rollout_log(rollout_id, args, samples, rollout_extra_metrics, rollout_time):
 
     log_dict["terminal/rollout_time"] = rollout_time
 
-    step = compute_rollout_step(args, rollout_id)
-    step_context = _step_context(args, rollout_id, rollout_step=step)
+    # Training rollout ids are zero-based internal indices. Public progress is
+    # the number of completed rollout batches, so a 1000-rollout run ends at
+    # global_step=1000 rather than 999.
+    legacy_step = compute_rollout_step(args, rollout_id)
+    step = int(rollout_id) + 1
+    step_context = _step_context(args, rollout_id, rollout_step=legacy_step)
     log_dict["rollout/step"] = step
     log_dict["axis/rollout_step"] = step_context["rollout_step"]
     log_dict["axis/train_step"] = step_context["train_step"]
@@ -2849,18 +2982,25 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
         samples = info.get("samples") if isinstance(info, dict) else None
         if samples:
             all_samples.extend(samples)
-            records.append(
-                _metric_record_from_samples(
-                    args=args,
-                    phase="eval",
-                    dataset_name=dataset_name,
-                    source_datasets=[str(raw_name)],
-                    rollout_id=rollout_id,
-                    step=step,
-                    samples=samples,
-                    step_context=step_context,
-                )
+            record = _metric_record_from_samples(
+                args=args,
+                phase="eval",
+                dataset_name=dataset_name,
+                source_datasets=[str(raw_name)],
+                rollout_id=rollout_id,
+                step=step,
+                samples=samples,
+                step_context=step_context,
             )
+            protocol_summary, task_records = _eval_protocol_summary(samples)
+            record.update(protocol_summary)
+            _write_eval_protocol_artifacts(
+                dataset_name=dataset_name,
+                step=step,
+                summary={**protocol_summary, "dataset": dataset_name, "global_step": step},
+                task_records=task_records,
+            )
+            records.append(record)
             continue
 
         rewards = info.get("rewards", []) if isinstance(info, dict) else []
@@ -2877,7 +3017,10 @@ def eval_rollout_log(rollout_id, args, data, extra_metrics=None):
             )
         )
 
-    if len(records) > 1:
+    protocol_streams = {"seta_fixed48_exploit", "seta_fixed48_explore"}
+    if len(records) > 1 and not protocol_streams.intersection(
+        {str(record.get("dataset")) for record in records}
+    ):
         if all_samples:
             records.append(
                 _metric_record_from_samples(
