@@ -478,8 +478,17 @@ done
 # Only add import roots. Adding ${SCRIPT_DIR} (the agentic_rl package directory)
 # makes agentic_rl/platform shadow Python's stdlib `platform` module and causes
 # every runtime-env Ray worker to crash before registration.
-# Do NOT inject conda site-packages — Ray workers already use the prepared Python.
 RUNTIME_PYTHONPATH="${MEGATRON_DIR}:${REPO_ROOT}:${SLIME_DIR}"
+# A harness overlay may expose selected pure-Python packages that the prepared
+# RJob image lacks.  It must never expose a whole conda site-packages tree,
+# which could replace the image's binary torch/vLLM stack.
+if [[ -n "${LIGHTRL_RUNTIME_HARNESS_OVERLAY:-}" ]]; then
+  [[ -d "${LIGHTRL_RUNTIME_HARNESS_OVERLAY}" ]] || {
+    log "ERROR: missing runtime harness overlay: ${LIGHTRL_RUNTIME_HARNESS_OVERLAY}"
+    exit 1
+  }
+  RUNTIME_PYTHONPATH="${RUNTIME_PYTHONPATH}:${LIGHTRL_RUNTIME_HARNESS_OVERLAY}"
+fi
 if ! PYTHONPATH="${RUNTIME_PYTHONPATH}" "${TRAIN_PYTHON}" - <<'PY'
 import platform
 
