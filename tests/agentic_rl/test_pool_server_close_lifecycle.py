@@ -253,6 +253,43 @@ def test_close_allocated_run_cleans_up_without_unpack_error(monkeypatch, tmp_pat
     asyncio.run(_case())
 
 
+def test_global_run_cap_applies_across_task_keys_and_releases_after_close(
+    monkeypatch, tmp_path
+):
+    async def _case():
+        pool_server = _install_import_stubs(monkeypatch)
+        env = _DummyEnv()
+
+        class TestWorkerPool(pool_server.WorkerPool):
+            def _new_env(self):
+                return env
+
+        pool = TestWorkerPool(
+            max_tasks=8,
+            max_runs_per_task=8,
+            max_total_runs=2,
+            run_idle_ttl=1,
+            output_root=str(tmp_path),
+            default_timeouts=_TaskTimeouts(),
+            max_concurrent_closes=2,
+        )
+        first = await pool.allocate("task-a")
+        await pool.allocate("task-b")
+
+        with pytest.raises(pool_server.CapacityError) as exc_info:
+            await pool.allocate("task-c")
+        assert exc_info.value.code == "TOTAL_RUN_SLOTS_EXHAUSTED"
+        assert (await pool.status())["max_total_runs"] == 2
+
+        assert await pool.close_run(first["lease_id"], reason="release-cap")
+        if pool._closing_tasks:
+            await asyncio.gather(*pool._closing_tasks, return_exceptions=False)
+        third = await pool.allocate("task-c")
+        assert third["lease_id"] in pool._run_to_task
+
+    asyncio.run(_case())
+
+
 def test_close_cleanup_failure_is_retained_in_worker_status(monkeypatch, tmp_path):
     class FailingCleanupEnv(_DummyEnv):
         async def close(self):

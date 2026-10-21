@@ -78,13 +78,16 @@ bash deploy/workers/docker_worker_doctor.sh diagnose \
 | `ENV_SERVER_PORT` | `18081` | Port the pool server listens on |
 | `WORKER_MAX_TASKS` | `16` | Max tasks allocated per worker |
 | `WORKER_MAX_RUNS_PER_TASK` | `8` | Max concurrent runs per task |
+| `WORKER_MAX_TOTAL_RUNS` | `WORKER_MAX_TASKS * WORKER_MAX_RUNS_PER_TASK` | Global active run/network ceiling across tasks |
 | `TBENCH_DOCKER_IMAGE_SOURCE` | `build` | `build` or `pull` — build locally or pull from registry |
 | `TBENCH_DOCKER_PULL_PREFIX` | — | Image prefix for `pull` mode |
 | `COMPOSE_OVERRIDE_PATH` | — | Optional Docker Compose override file |
 
 Capacity sizing rule (from issue #3 §1):
 ```
-WORKER_MAX_TASKS × WORKER_MAX_RUNS_PER_TASK ≥ rollout_batch_size × n_samples_per_prompt
+The effective capacity is additionally capped by `WORKER_MAX_TOTAL_RUNS`; set it
+below the host's available Docker address-pool capacity so retries queue at
+`/allocate` instead of failing later during `docker compose up`.
 ```
 
 For 8×4 (current default), 16×8=128 has been observed to saturate dockerd. v2 launcher defaults to a more conservative 64×16=1024 to leave headroom.

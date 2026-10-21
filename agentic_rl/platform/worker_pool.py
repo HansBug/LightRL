@@ -81,11 +81,22 @@ class WorkerPool:
         run_idle_ttl: int,
         output_root: str,
         default_timeouts: TaskTimeouts,
+        max_total_runs: int | None = None,
         idempotency_ttl: int = 300,
         max_concurrent_closes: int = 8,
     ) -> None:
         self.max_tasks = max_tasks
         self.max_runs_per_task = max_runs_per_task
+        self.max_total_runs = max(
+            1,
+            int(
+                max_total_runs
+                if max_total_runs is not None
+                else _env_int(
+                    "WORKER_MAX_TOTAL_RUNS", max_tasks * max_runs_per_task
+                )
+            ),
+        )
         self.run_idle_ttl = run_idle_ttl
         self.output_root = Path(output_root).resolve()
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -865,6 +876,17 @@ class WorkerPool:
                         )
                         return {"lease_id": run_lease_id, "reused": True}
 
+            # max_tasks limits distinct task keys and max_runs_per_task limits
+            # fan-out for one key, but neither bounds the number of Docker
+            # networks alive across the pool.  Keep a global lease ceiling so
+            # compose cannot exhaust the daemon's finite default address pools.
+            if len(self._run_to_task) >= self.max_total_runs:
+                raise CapacityError(
+                    "TOTAL_RUN_SLOTS_EXHAUSTED",
+                    "Worker at total run capacity: "
+                    f"{len(self._run_to_task)}/{self.max_total_runs}",
+                )
+
             task_slot = self._tasks.get(task_key)
             if task_slot is not None and any(
                 run.reset_quarantined for run in task_slot.runs.values()
@@ -1610,6 +1632,7 @@ class WorkerPool:
                 "max_tasks": self.max_tasks,
                 "active_tasks": len(self._tasks),
                 "max_runs_per_task": self.max_runs_per_task,
+                "max_total_runs": self.max_total_runs,
                 "serial_task_ids": sorted(self._serial_task_ids),
                 "task_max_runs_overrides": dict(
                     sorted(self._task_max_runs_overrides.items())
