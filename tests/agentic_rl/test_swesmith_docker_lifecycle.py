@@ -148,6 +148,32 @@ def test_docker_build_and_start_paths_are_bounded() -> None:
     assert "timeout=timeout" in compose_source
 
 
+def test_docker_build_passes_configured_proxy_as_value_free_build_args() -> None:
+    tree = ast.parse(COMPOSE_UTILS.read_text(encoding="utf-8"))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_docker_build_args_with_proxy"
+    )
+    namespace: dict[str, object] = {}
+    exec(
+        compile(ast.Module(body=[helper], type_ignores=[]), str(COMPOSE_UTILS), "exec"),
+        namespace,
+    )
+    build_args = namespace["_docker_build_args_with_proxy"](
+        {"HTTP_PROXY": "sensitive", "NO_PROXY": "localhost"}
+    )
+    assert build_args == [
+        "build",
+        "--build-arg",
+        "HTTP_PROXY",
+        "--build-arg",
+        "NO_PROXY",
+    ]
+    assert "sensitive" not in build_args
+
+
 def test_swesmith_artifact_publication_and_consumers_share_a_lock() -> None:
     downloader = DOWNLOADER.read_text(encoding="utf-8")
     smoke_client = SMOKE_CLIENT.read_text(encoding="utf-8")

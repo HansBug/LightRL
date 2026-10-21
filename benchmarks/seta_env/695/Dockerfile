@@ -21,6 +21,24 @@ FROM ubuntu:18.04
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Bootstrap the Ubuntu 18.04 CA bundle from a checksum-pinned official package.
+# The minimal upstream base has no CA store, while this worker's proxy only
+# serves the Ubuntu repositories over HTTPS.
+ADD --checksum=sha256:ebab7dae205c7ad4a6d12cada2b611896ebc0d8b0477d96d2659b9959e5f4703 \
+    https://archive.ubuntu.com/ubuntu/pool/main/c/ca-certificates/ca-certificates_20230311ubuntu0.18.04.1_all.deb \
+    /tmp/ca-certificates.deb
+RUN mkdir -p /tmp/ca-root /etc/ssl/certs \
+    && dpkg-deb -x /tmp/ca-certificates.deb /tmp/ca-root \
+    && cat /tmp/ca-root/usr/share/ca-certificates/mozilla/*.crt \
+        > /etc/ssl/certs/ca-certificates.crt \
+    && rm -rf /tmp/ca-root /tmp/ca-certificates.deb
+
+# Keep the intentionally old Ubuntu 18.04 toolchain, changing transport only.
+RUN sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list
+
 # Install basic tools with default (outdated) versions
 # Ubuntu 18.04 defaults: CMake 3.10.2, GCC 7.5.0
 RUN apt-get update && apt-get install -y \
@@ -250,4 +268,3 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 EOF
-

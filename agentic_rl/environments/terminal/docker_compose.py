@@ -84,6 +84,22 @@ def _shorten_output(text: str | None, max_chars: int = 4000) -> str:
     return f"{stripped[:max_chars]}...(truncated, total={len(stripped)} chars)"
 
 
+def _docker_build_args_with_proxy(env: dict[str, str]) -> list[str]:
+    """Pass configured proxy variables to BuildKit without exposing their values."""
+    args = ["build"]
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ):
+        if env.get(name):
+            args.extend(["--build-arg", name])
+    return args
+
+
 def _build_docker_pull_error_message(
     *,
     image: str,
@@ -478,9 +494,18 @@ def build_docker_image(
             _raise_if_cancelled(cancel_event, build_key=build_key, stage="before_build")
             logger.info("Building Docker image for task=%s image=%s", task_name, build_key)
             try:
-                command = compose_manager.get_docker_compose_command(["build"])
-                compose_manager.env["http_proxy"] = os.getenv("HTTP_PROXY", "")
-                compose_manager.env["https_proxy"] = os.getenv("HTTPS_PROXY", "")
+                for uppercase, lowercase in (
+                    ("HTTP_PROXY", "http_proxy"),
+                    ("HTTPS_PROXY", "https_proxy"),
+                    ("NO_PROXY", "no_proxy"),
+                ):
+                    value = os.getenv(uppercase) or os.getenv(lowercase) or ""
+                    if value:
+                        compose_manager.env[uppercase] = value
+                        compose_manager.env[lowercase] = value
+                command = compose_manager.get_docker_compose_command(
+                    _docker_build_args_with_proxy(compose_manager.env)
+                )
                 subprocess.run(
                     command,
                     env=compose_manager.env,

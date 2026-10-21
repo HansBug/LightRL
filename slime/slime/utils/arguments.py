@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import yaml
@@ -877,6 +878,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eval-temperature", type=float, default=None)
             parser.add_argument("--eval-top-p", type=float, default=None)
             parser.add_argument("--eval-top-k", type=int, default=None)
+            parser.add_argument(
+                "--eval-seed",
+                type=int,
+                default=None,
+                help="Base seed used to derive deterministic per-prompt eval sampling seeds.",
+            )
+            parser.add_argument(
+                "--eval-steps",
+                type=int,
+                nargs="+",
+                default=None,
+                help="Explicit completed rollout-step checkpoints at which to evaluate; may include 0.",
+            )
             parser.add_argument("--eval-max-response-len", type=int, default=None)
             parser.add_argument("--eval-max-prompt-len", type=int, default=None)
             parser.add_argument("--eval-min-new-tokens", type=int, default=None)
@@ -1764,10 +1778,42 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     defaults: dict[str, Any] = {}
 
     if args.eval_config:
-        from omegaconf import OmegaConf
+        try:
+            from omegaconf import OmegaConf
+        except ModuleNotFoundError:
+            # Some production images predate slime's optional OmegaConf
+            # dependency.  PyYAML is already required by this module; retain a
+            # narrow compatibility path for ${oc.env:NAME} interpolation so an
+            # eval-only config does not make training fail at argument parsing.
+            env_pattern = re.compile(r"\$\{oc\.env:([A-Za-z_][A-Za-z0-9_]*)\}")
 
-        cfg = OmegaConf.load(args.eval_config)
-        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+            def resolve_env(value):
+                if isinstance(value, dict):
+                    return {key: resolve_env(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [resolve_env(item) for item in value]
+                if not isinstance(value, str):
+                    return value
+
+                def replace(match):
+                    name = match.group(1)
+                    if name not in os.environ:
+                        raise ValueError(
+                            f"--eval-config references unset environment variable {name}"
+                        )
+                    return os.environ[name]
+
+                return env_pattern.sub(replace, value)
+
+            with open(args.eval_config, encoding="utf-8") as handle:
+                cfg_dict = resolve_env(yaml.safe_load(handle))
+            logger.warning(
+                "omegaconf is unavailable; parsed --eval-config with the "
+                "PyYAML ${oc.env:NAME} compatibility path"
+            )
+        else:
+            cfg = OmegaConf.load(args.eval_config)
+            cfg_dict = OmegaConf.to_container(cfg, resolve=True)
         if not isinstance(cfg_dict, dict):
             raise ValueError("--eval-config must contain a mapping at the root.")
 
