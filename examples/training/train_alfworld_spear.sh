@@ -48,8 +48,10 @@ if [[ ! -d "${ALFWORLD_DATA_DIR}/json_2.1.1" && ! -d "${ALFWORLD_DATA_DIR}/gener
 fi
 
 cd "${OFFICIAL_ROOT}"
-"${PYTHON_BIN}" -m examples.data_preprocess.prepare \
-  --mode text --train_data_size "${TRAIN_DATA_SIZE}" --val_data_size "${VAL_DATA_SIZE}"
+if [[ ! -f "${OFFICIAL_ROOT}/data/verl-agent/text/train.parquet" || ! -f "${OFFICIAL_ROOT}/data/verl-agent/text/test.parquet" ]]; then
+  "${PYTHON_BIN}" -m examples.data_preprocess.prepare \
+    --mode text --train_data_size "${TRAIN_DATA_SIZE}" --val_data_size "${VAL_DATA_SIZE}"
+fi
 
 exec "${PYTHON_BIN}" -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \

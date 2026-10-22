@@ -13,7 +13,7 @@ RJOB_MOUNT_NARMODEL="${RJOB_MOUNT_NARMODEL:-gpfs://gpfs2/narmodel:/mnt/shared-st
 RJOB_MOUNT_TRUSTCYBER="${RJOB_MOUNT_TRUSTCYBER:-gpfs://gpfs2/trustcyberdata:/mnt/shared-storage-gpfs2/trustcyberdata}"
 
 command -v rjob >/dev/null || { echo "rjob CLI not found" >&2; exit 1; }
-CMD="cd ${ROOT} && MODEL_PATH=${MODEL_PATH:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B} ALFWORLD_DATA_DIR=${ALFWORLD_DATA_DIR:-/mnt/shared-storage-user/puyuan/data/alfworld} SPEAR_VERL_AGENT_ROOT=${SPEAR_VERL_AGENT_ROOT:-/mnt/shared-storage-user/puyuan/code/archive/SPEAR/verl-agent} N_GPUS=${N_GPUS:-${RJOB_GPU}} bash examples/training/train_alfworld_spear.sh"
+CMD="cd ${ROOT} && MODEL_PATH=${MODEL_PATH:-/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B} ALFWORLD_DATA_DIR=${ALFWORLD_DATA_DIR:-/mnt/shared-storage-user/puyuan/data/alfworld} SPEAR_VERL_AGENT_ROOT=${SPEAR_VERL_AGENT_ROOT:-/mnt/shared-storage-user/puyuan/code/archive/SPEAR/verl-agent} N_GPUS=${N_GPUS:-${RJOB_GPU}} WANDB_MODE=${WANDB_MODE:-offline} bash examples/training/train_alfworld_spear.sh"
 
 echo "[alfworld-rjob] submitting ${RJOB_NAME} (${RJOB_GPU} GPU, ${RJOB_CPU} CPU, ${RJOB_MEMORY_MB} MiB)"
 exec rjob submit \

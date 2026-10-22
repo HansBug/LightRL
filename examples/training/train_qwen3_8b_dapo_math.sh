@@ -10,6 +10,173 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+MODE="${MODE:-formal}"
+DRY_RUN="${DRY_RUN:-0}"
+IPDB_MODE_REQUESTED="${IPDB_MODE:-}"
+IPDB_MODE="${IPDB_MODE:-0}"
+IPDB_BREAKPOINT="${IPDB_BREAKPOINT:-}"
+EXTRA_ARGS=()
+
+usage() {
+  cat <<'EOF'
+Usage: bash examples/training/train_qwen3_8b_dapo_math.sh [options] [-- extra-slime-args]
+
+Modes:
+  --mode formal       4-GPU AIME25 + DAPO training (default)
+  --mode debug        4-GPU, one-rollout debug configuration
+  --formal            Alias for --mode formal
+  --debug             Alias for --mode debug
+
+Debug options:
+  --ipdb              Run the train_async driver under ipdb (debug default)
+  --no-ipdb           Disable the driver ipdb wrapper
+  --breakpoint FILE:LINE
+                      Set an initial driver breakpoint, e.g.
+                      slime/train_async.py:159
+
+Other options:
+  --dry-run           Print the final Python argv without starting training
+  -h, --help          Show this help
+  --                  Pass remaining arguments to slime/train_async.py
+
+All recipe values can also be overridden with environment variables. In
+particular: HF_CKPT, REF_LOAD, MATH_DATA_ROOT, TRAIN_PYTHON, RUN_ID, RUN_DIR,
+NUM_ROLLOUT, ROLLOUT_BATCH_SIZE, N_SAMPLES, ACTOR_GPUS, and ROLLOUT_GPUS.
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --mode)
+      (($# >= 2)) || { echo "[math-dapo] --mode requires formal or debug" >&2; exit 2; }
+      MODE="$2"
+      shift 2
+      ;;
+    --formal)
+      MODE=formal
+      shift
+      ;;
+    --debug)
+      MODE=debug
+      shift
+      ;;
+    --ipdb)
+      IPDB_MODE=1
+      IPDB_MODE_REQUESTED=1
+      shift
+      ;;
+    --no-ipdb)
+      IPDB_MODE=0
+      IPDB_MODE_REQUESTED=0
+      shift
+      ;;
+    --breakpoint|--ipdb-breakpoint)
+      (($# >= 2)) || { echo "[math-dapo] --breakpoint requires FILE:LINE" >&2; exit 2; }
+      IPDB_BREAKPOINT="$2"
+      IPDB_MODE=1
+      IPDB_MODE_REQUESTED=1
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      EXTRA_ARGS+=("$@")
+      break
+      ;;
+    *)
+      # Preserve forward compatibility with new train_async.py arguments.
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+case "${MODE}" in
+  formal) ;;
+  debug)
+    # Keep the topology identical to the allocated job while making the first
+    # interactive pass small and deterministic.
+    NUM_GPUS="${NUM_GPUS:-4}"
+    ACTOR_GPUS="${ACTOR_GPUS:-2}"
+    ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
+    ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+    TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-2}"
+    NUM_ROLLOUT="${NUM_ROLLOUT:-1}"
+    ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"
+    N_SAMPLES="${N_SAMPLES:-1}"
+    GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-1}"
+    RESPONSE_CAP="${RESPONSE_CAP:-8192}"
+    DAPO_OVERLONG_BUFFER_LEN="${DAPO_OVERLONG_BUFFER_LEN:-2048}"
+    EVAL_DATASETS="${EVAL_DATASETS:-aime-2025}"
+    EVAL_INTERVAL="${EVAL_INTERVAL:-1000000000}"
+    EVAL_N_SAMPLES="${EVAL_N_SAMPLES:-1}"
+    ENABLE_TRAJECTORY_REPLAY="${ENABLE_TRAJECTORY_REPLAY:-0}"
+    USE_FAULT_TOLERANCE="${USE_FAULT_TOLERANCE:-0}"
+    ROLLOUT_GENERATION_MAX_RETRIES="${ROLLOUT_GENERATION_MAX_RETRIES:-0}"
+    ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF="${ROLLOUT_GENERATION_RETRY_INITIAL_BACKOFF:-0}"
+    ROLLOUT_GENERATION_RETRY_MAX_BACKOFF="${ROLLOUT_GENERATION_RETRY_MAX_BACKOFF:-0}"
+    SGLANG_SERVER_CONCURRENCY="${SGLANG_SERVER_CONCURRENCY:-1}"
+    OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-1}"
+    DYNAMIC_SAMPLING_MAX_GROUPS="${DYNAMIC_SAMPLING_MAX_GROUPS:-1}"
+    USE_DYNAMIC_BATCH_SIZE="${USE_DYNAMIC_BATCH_SIZE:-0}"
+    ROLLOUT_SHUFFLE="${ROLLOUT_SHUFFLE:-0}"
+    BALANCE_DATA="${BALANCE_DATA:-0}"
+    DEBUG_ROLLOUT_DATA_SCOPE="${DEBUG_ROLLOUT_DATA_SCOPE:-both}"
+    SAVE_INTERVAL="${SAVE_INTERVAL:-1}"
+    IPDB_MODE="${IPDB_MODE_REQUESTED:-1}"
+    IPDB_BREAKPOINT="${IPDB_BREAKPOINT:-${REPO_ROOT}/slime/train_async.py:159}"
+    DEBUG_MODE=1
+    export DEBUG_MODE
+    ;;
+  *)
+    echo "[math-dapo] invalid mode=${MODE}; expected formal or debug" >&2
+    exit 2
+    ;;
+esac
+
+# Prefer the shared training environment when it is mounted; explicit caller
+# values remain authoritative.
+if [[ -z "${TRAIN_PYTHON:-}" ]]; then
+  if [[ -x "/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin/python" ]]; then
+    TRAIN_PYTHON="/mnt/shared-storage-user/puyuan/conda_envs/lightrft_py312/bin/python"
+  else
+    TRAIN_PYTHON=python3
+  fi
+fi
+if [[ -z "${HF_CKPT:-}" && -e "/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B" ]]; then
+  HF_CKPT="/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B"
+fi
+if [[ -z "${REF_LOAD:-}" && -e "/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist" ]]; then
+  REF_LOAD="/mnt/shared-storage-user/puyuan/code/slime/Qwen3-8B_torch_dist"
+fi
+if [[ -z "${MATH_DATA_ROOT:-}" && -d "/mnt/shared-storage-user/puyuan/data/math_rlvr" ]]; then
+  MATH_DATA_ROOT="/mnt/shared-storage-user/puyuan/data/math_rlvr"
+fi
+SLIME_DIR="${SLIME_DIR:-${REPO_ROOT}/slime}"
+MEGATRON_DIR="${MEGATRON_DIR:-${REPO_ROOT}/Megatron-LM}"
+[[ -d "${MEGATRON_DIR}/megatron" ]] || {
+  echo "[math-dapo] Megatron package not found under MEGATRON_DIR=${MEGATRON_DIR}" >&2
+  exit 2
+}
+# Slime's Megatron backend imports `megatron.training` directly. Keep all
+# bundled source roots visible to the driver and Ray child processes.
+export PYTHONPATH="${MEGATRON_DIR}:${REPO_ROOT}:${SLIME_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+export NVTE_FP8_BLOCK_SCALING_FP32_SCALES="${NVTE_FP8_BLOCK_SCALING_FP32_SCALES:-1}"
+export PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1
+if ! "${TRAIN_PYTHON}" -c 'import importlib.util; raise SystemExit(0 if importlib.util.find_spec("megatron") else 1)'; then
+  echo "[math-dapo] Python cannot locate megatron; check PYTHONPATH=${PYTHONPATH}" >&2
+  exit 2
+fi
+
 # Silent checkpoint fallbacks are dangerous for a capability experiment.
 : "${HF_CKPT:?set HF_CKPT to the checkpoint being trained}"
 : "${REF_LOAD:?set REF_LOAD to the reference checkpoint}"
@@ -75,10 +242,10 @@ ROLLOUT_HEALTH_CHECK_TIMEOUT="${ROLLOUT_HEALTH_CHECK_TIMEOUT:-30}"
 ROLLOUT_HEALTH_CHECK_FIRST_WAIT="${ROLLOUT_HEALTH_CHECK_FIRST_WAIT:-60}"
 export EVAL_ROLLOUT_MAX_CONCURRENCY
 SEED="${SEED:-1}"
-NUM_GPUS="${NUM_GPUS:-1}"
-ACTOR_GPUS="${ACTOR_GPUS:-${NUM_GPUS}}"
-ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"
-ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}"
+NUM_GPUS="${NUM_GPUS:-4}"
+ACTOR_GPUS="${ACTOR_GPUS:-2}"
+ROLLOUT_GPUS="${ROLLOUT_GPUS:-2}"
+ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
 COLOCATE="${COLOCATE:-0}"
 TRAIN_BACKEND="${TRAIN_BACKEND:-megatron}"
 MODEL_TRANSFORMER_IMPL="${MODEL_TRANSFORMER_IMPL:-transformer_engine}"
@@ -163,6 +330,15 @@ export TRAIN_DATA TRAIN_DATASET
 
 case "${REWARD_TYPE}" in math|dapo|boxed) ;; *) echo "[math-dapo] invalid REWARD_TYPE=${REWARD_TYPE}" >&2; exit 2 ;; esac
 (( RESPONSE_CAP > 0 && ROLLOUT_BATCH_SIZE > 0 && N_SAMPLES > 0 )) || { echo "[math-dapo] cap/batch/n must be positive" >&2; exit 2; }
+case "${IPDB_MODE}" in 0|1) ;; *) echo "[math-dapo] IPDB_MODE must be 0 or 1" >&2; exit 2 ;; esac
+if [[ "${DRY_RUN}" != "1" ]]; then
+  command -v nvidia-smi >/dev/null || { echo "[math-dapo] nvidia-smi is required outside --dry-run" >&2; exit 2; }
+  VISIBLE_GPUS="$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true)"
+  (( VISIBLE_GPUS >= NUM_GPUS )) || {
+    echo "[math-dapo] requires at least ${NUM_GPUS} visible GPUs, found ${VISIBLE_GPUS}" >&2
+    exit 2
+  }
+fi
 if [[ -z "${NUM_ROLLOUT}" ]]; then
   (( NUM_EPOCHS > 0 )) || { echo "[math-dapo] NUM_EPOCHS must be positive" >&2; exit 2; }
 else
@@ -185,7 +361,18 @@ for eval_name in "${_EVAL_NAMES[@]}"; do
   EVAL_ARGS+=(--eval-prompt-data "${eval_name}" "${eval_path}")
 done
 
-CMD=("${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py"
+PYTHON_CMD=("${TRAIN_PYTHON}" -u)
+if [[ "${IPDB_MODE}" == "1" ]]; then
+  # ipdb wraps the driver process. Ray actors still run remotely and do not
+  # inherit this terminal's stdin; see the operations runbook for that case.
+  PYTHON_CMD=("${TRAIN_PYTHON}" -m ipdb)
+  if [[ -n "${IPDB_BREAKPOINT}" ]]; then
+    PYTHON_CMD+=(-c "b ${IPDB_BREAKPOINT}")
+  fi
+  PYTHON_CMD+=(-c continue)
+fi
+
+CMD=("${PYTHON_CMD[@]}" "${SLIME_DIR}/train_async.py"
   --hf-checkpoint "${HF_CKPT}" --ref-load "${REF_LOAD}"
   --prompt-data "${TRAIN_DATA}" --input-key prompt --label-key label
   --reward-key score --rm-type "${REWARD_TYPE}"
@@ -221,6 +408,7 @@ CMD=("${TRAIN_PYTHON}" -u "${SLIME_DIR}/train_async.py"
   --actor-num-nodes 1 --actor-num-gpus-per-node "${ACTOR_GPUS}"
   --seed "${SEED}" --save "${RUN_DIR}/checkpoints" --save-interval "${SAVE_INTERVAL:-20}"
   "${EVAL_ARGS[@]}")
+CMD+=("${EXTRA_ARGS[@]}")
 
 if [[ "${USE_FAULT_TOLERANCE}" == "1" ]]; then
   CMD+=(--use-fault-tolerance

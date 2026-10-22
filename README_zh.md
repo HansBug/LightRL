@@ -25,7 +25,7 @@ LightRL 是面向交互式环境中语言模型智能体的强化学习后训练
 | Harness | 训练：Camel-Agent、Claude Code CLI；评测：另支持 Terminus-2 | `agentic_rl/harnesses/`、`agentic_rl/harnesses/eval/` |
 | Environment | SETA、Agent-SafetyBench、AgentHarm、Tau2；SWE-smith / SWE-Verified 数据转换工具 | `agentic_rl/environments/`、`agentic_rl/data/` |
 | Model | 由 recipe 指定（稳定 recipe 当前覆盖 Qwen3-8B、GLM-5.1） | `configs/rollout/` |
-| Algorithm | GRPO / DAPO、DIVE-PO | Slime 后端与 `agentic_rl/algorithms/` |
+| Algorithm | GRPO / DAPO、DIVE-PO、SPEAR（SIL 回放基线） | Slime 后端与 `agentic_rl/algorithms/` |
 
 LightRL 内置 Slime 与 Megatron-LM 训练后端。终端环境由 Docker worker
 隔离执行，训练进程通过 HTTP 调用。worker 既可部署在独立的 CPU/Docker
@@ -208,6 +208,10 @@ CONFIRM_LOCAL_CLEANUP=1 \
 | `train_qwen3_8b_seta_dive_po.sh` | Camel-Agent | Qwen3-8B | SETA | DIVE-PO |
 | `train_qwen3_8b_mixed_dapo.sh` | Camel-Agent | Qwen3-8B | SETA + Agent-SafetyBench + AgentHarm | DAPO |
 | `train_glm_5_1_seta_dapo.sh` | Camel-Agent | GLM-5.1 | SETA | DAPO |
+| `train_qwen3_8b_seta_spear.sh` | Camel-Agent | Qwen3-8B | SETA | DAPO + SPEAR SIL 回放 |
+| `train_qwen3_8b_tb21_spear.sh` | Camel-Agent | Qwen3-8B | TB2.1 转换数据 | DAPO + SPEAR SIL 回放 |
+| `train_qwen3_8b_dapo_math.sh` | —（数学 RLVR，无终端交互） | Qwen3-8B | AIME-2025（`TRAIN_DATASET` 可换） | DAPO，可启用 SPEAR 回放 |
+| `train_alfworld_spear.sh` | 官方 verl-agent 封装 | Qwen3-8B | ALFWorld | SPEAR（官方 recipe 口径） |
 
 先在 GPU 训练环境中执行 `--dry-run`，检查解析后的数据、模型、并行参数与
 后端命令：
@@ -316,6 +320,7 @@ python3 -m compileall -q agentic_rl
 - [配置说明](docs/configuration.md)——recipe、环境变量与覆盖优先级
 - [部署总览](deploy/README.md)——worker、运行时资源与运维工具的职责边界
 - [DIVE-PO](docs/algorithms/dive_po_dual_stream.md)——双流优势与奖励后处理
+- [SPEAR](docs/algorithms/spear_lightrl_baseline_zh.md)——SIL 回放基线与官方实现的差异，SETA / TB2.1 / ALFWorld / 数学 RLVR 入口
 - [Harness 选择](docs/harnesses/README.md)——Camel-Agent / Claude Code 接入
 - [评测工具](docs/evaluation/README.md)——通用评测编排、SETA fixed12 与格式导出
 - [Docker worker](deploy/workers/README.md)——启动、容量、预热、清理与恢复
